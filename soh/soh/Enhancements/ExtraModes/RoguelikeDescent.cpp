@@ -29,6 +29,7 @@
 #include <cstring>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -236,6 +237,8 @@ static struct {
     bool arena;             // an open-world survival floor
     s16 expectedScene;      // where this floor takes place; landing anywhere else means Link left (fled)
     bool fled;
+    bool miniBoss; // a boss floor where no boss could be beaten with Link's gear: tough enemies instead
+    int miniBossSet;
 } sRun;
 
 static std::vector<Actor*> sArenaEnemies; // on arena floors only the enemies we spawned have to be beaten
@@ -1152,6 +1155,43 @@ static void SpawnWave(PlayState* play) {
     }
 }
 
+// Mini-boss floors: when no real boss can be beaten with Link's current gear, a boss floor becomes a fight against
+// one tough sword-beatable foe (or a pair) in a dungeon room, with the same rewards as a boss.
+typedef struct {
+    const char* name;
+    std::vector<RoguelikeEnemy> enemies;
+} MiniBossSet;
+
+static const MiniBossSet sMiniBossSets[] = {
+    { "Iron Knuckle", { { ACTOR_EN_IK, 3, false } } },
+    { "Stalfos Duo", { { ACTOR_EN_TEST, 2, false }, { ACTOR_EN_TEST, 2, false } } },
+    { "Dinolfos Pack", { { ACTOR_EN_ZF, -2, false }, { ACTOR_EN_ZF, -2, false } } },
+    { "Dark Link", { { ACTOR_EN_TORCH2, 0, false } } },
+    { "Flare Dancer", { { ACTOR_EN_FD, 0, false } } },
+};
+
+static std::unordered_set<Actor*> sMiniBossActors;
+
+static void SpawnMiniBoss(PlayState* play) {
+    Player* player = GET_PLAYER(play);
+    const MiniBossSet& set = sMiniBossSets[sRun.miniBossSet];
+    for (const RoguelikeEnemy& enemy : set.enemies) {
+        Vec3f pos;
+        if (!FindEnemySpawnSpot(play, &pos)) {
+            pos = player->actor.world.pos; // fall back to somewhere in front of Link
+            pos.x += Math_SinS(player->actor.shape.rot.y) * 200.0f;
+            pos.z += Math_CosS(player->actor.shape.rot.y) * 200.0f;
+        }
+        s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos);
+        Actor* spawned =
+            Actor_Spawn(&play->actorCtx, play, enemy.actorId, pos.x, pos.y, pos.z, 0, yaw, 0, enemy.params);
+        if (spawned != NULL) {
+            sMiniBossActors.insert(spawned);
+        }
+    }
+    Sfx_PlaySfxCentered(NA_SE_SY_WARNING_COUNT_N);
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Room remixes: a themed layout of props and traps dropped around the room, built from existing actors.
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1427,7 +1467,8 @@ static void SetUpEnemy(Actor* actor) {
     if (sRun.modifier == FLOORMOD_ELITE) {
         eliteChance = 100;
     }
-    if (sRun.bossFloor) {
+    bool isMiniBoss = sMiniBossActors.count(actor) > 0;
+    if (sRun.bossFloor || sRun.miniBoss) {
         eliteChance = 0; // boss fights are hard enough
     }
     if (ROGUELIKE_ELITES && RandInt(1, 100) <= eliteChance) {
@@ -1439,6 +1480,10 @@ static void SetUpEnemy(Actor* actor) {
     f32 healthScale = 1.0f + 0.10f * (info.level - 1);
     if (info.affix != AFFIX_NONE) {
         healthScale *= 1.5f;
+    }
+    if (isMiniBoss) {
+        healthScale *= 1.25f;
+        info.level += 3; // more XP
     }
     // Giants: bigger and tougher. A few enemies only work at their normal size (same list as Enemy Sizes).
     bool canGrow = actor->id != ACTOR_EN_BROB && actor->id != ACTOR_EN_DHA && actor->id != ACTOR_EN_DH;
@@ -1506,6 +1551,7 @@ static void OnActorUpdateRoguelike(void* refActor) {
 
 static void OnActorDestroyRoguelike(void* refActor) {
     sEnemies.erase((Actor*)refActor);
+    sMiniBossActors.erase((Actor*)refActor);
     sArenaEnemies.erase(std::remove(sArenaEnemies.begin(), sArenaEnemies.end(), (Actor*)refActor), sArenaEnemies.end());
     std::replace(sRemixHazards.begin(), sRemixHazards.end(), (Actor*)refActor, (Actor*)NULL);
     for (int i = 0; i < sChoiceCount; i++) {
@@ -1649,8 +1695,8 @@ typedef struct {
     bool (*canFight)(); // adult Link needs certain gear to be able to win
 } RoguelikeBoss;
 
-static bool BossNeedsNothing() {
-    return true;
+static bool BossNeedsHammer() {
+    return HasItem(ITEM_HAMMER); // Volvagia has to be knocked out of the lava with the hammer
 }
 static bool BossNeedsBow() {
     return HasItem(ITEM_BOW);
@@ -1666,7 +1712,7 @@ static bool BossNeedsMirrorShield() {
 }
 
 static const RoguelikeBoss sBosses[] = {
-    { SCENE_FIRE_TEMPLE_BOSS, ENTR_FIRE_TEMPLE_BOSS_ENTRANCE, "Volvagia", EQUIP_VALUE_TUNIC_GORON, BossNeedsNothing },
+    { SCENE_FIRE_TEMPLE_BOSS, ENTR_FIRE_TEMPLE_BOSS_ENTRANCE, "Volvagia", EQUIP_VALUE_TUNIC_GORON, BossNeedsHammer },
     { SCENE_DEKU_TREE_BOSS, ENTR_DEKU_TREE_BOSS_ENTRANCE, "Queen Gohma", EQUIP_VALUE_TUNIC_KOKIRI, BossNeedsBow },
     { SCENE_DODONGOS_CAVERN_BOSS, ENTR_DODONGOS_CAVERN_BOSS_ENTRANCE, "King Dodongo", EQUIP_VALUE_TUNIC_GORON,
       BossNeedsBombs },
@@ -1724,7 +1770,16 @@ static void SetRunMirror(bool on) {
     ApplyMirrorWorldGfxPatches();
 }
 
-// Sets up a boss floor. Returns the boss room entrance.
+static bool AnyBossBeatable() {
+    for (const RoguelikeBoss& boss : sBosses) {
+        if (boss.canFight()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Sets up a boss floor (only called when at least one boss is beatable). Returns the boss room entrance.
 static s32 PrepareBossFloor() {
     std::vector<int> eligible;
     for (int i = 0; i < (int)ARRAY_COUNT(sBosses); i++) {
@@ -1819,14 +1874,19 @@ static s32 PrepareNextFloor() {
     GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_GORON);
     GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_ZORA);
 
+    sRun.miniBoss = false;
     if (IsBossFloor(sRun.floor)) {
-        return PrepareBossFloor();
+        if (AnyBossBeatable()) {
+            return PrepareBossFloor();
+        }
+        sRun.miniBoss = true;
+        sRun.miniBossSet = RandInt(0, (int)ARRAY_COUNT(sMiniBossSets) - 1);
     }
     sRun.bossFloor = false;
-    sRun.modifier = RollFloorModifier(sRun.floor);
-    sRun.remix = RollRoomRemix();
+    sRun.modifier = sRun.miniBoss ? FLOORMOD_NONE : RollFloorModifier(sRun.floor);
+    sRun.remix = sRun.miniBoss ? REMIX_NONE : RollRoomRemix();
 
-    if (IsArenaFloor(sRun.floor)) {
+    if (!sRun.miniBoss && IsArenaFloor(sRun.floor)) {
         s32 entrance = PrepareArenaFloor();
         if (sRun.modifier != FLOORMOD_NONE) {
             Notify(std::string(sModifierNames[sRun.modifier]) + "! ", sModifierDescriptions[sRun.modifier]);
@@ -1847,6 +1907,9 @@ static s32 PrepareNextFloor() {
     sRun.lastDungeon = dungeon;
 
     Notify("Floor " + std::to_string(sRun.floor) + ": ", d.name);
+    if (sRun.miniBoss) {
+        Notify("MINI-BOSS: ", sMiniBossSets[sRun.miniBossSet].name);
+    }
     if (sRun.modifier != FLOORMOD_NONE) {
         Notify(std::string(sModifierNames[sRun.modifier]) + "! ", sModifierDescriptions[sRun.modifier]);
     }
@@ -1931,6 +1994,8 @@ static void ResetRunState() {
     sRun.arena = false;
     sRun.expectedScene = -1;
     sRun.fled = false;
+    sRun.miniBoss = false;
+    sRun.miniBossSet = 0;
     sLastBoss = -1;
     sChoiceCount = 0;
     ResetLeveling();
@@ -2162,7 +2227,11 @@ static void OnPlayerUpdateRoguelike() {
         case ROOM_STATE_ENTERING:
             if (sRun.stateFrames >= WAVE_SPAWN_DELAY) {
                 ApplyRoomRemix(play);
-                SpawnWave(play);
+                if (sRun.miniBoss) {
+                    SpawnMiniBoss(play);
+                } else {
+                    SpawnWave(play);
+                }
                 sRun.wavesLeft--;
                 EnterRoomState(ROOM_STATE_FIGHTING);
             }
@@ -2179,12 +2248,14 @@ static void OnPlayerUpdateRoguelike() {
                     sRun.wavesLeft--;
                     Sfx_PlaySfxCentered(NA_SE_SY_WARNING_COUNT_N);
                     SpawnWave(play);
+                } else if (sRun.miniBoss) {
+                    OnBossCleared(play);
                 } else {
                     OnRoomCleared(play, false);
                 }
                 break;
             }
-            int limit = ROGUELIKE_ROOM_TIME_LIMIT;
+            int limit = sRun.miniBoss ? 0 : ROGUELIKE_ROOM_TIME_LIMIT; // no timer on a mini-boss
             if (sRun.arena && limit > 0) {
                 limit = std::max(limit, 180); // arenas have more to fight
             }
@@ -2256,10 +2327,14 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sPendingAffix = AFFIX_NONE;
     sChoiceCount = 0;
     sArenaEnemies.clear();
+    sMiniBossActors.clear();
     sRemixHazards.clear();
     sRemixApplied = false;
     if (sRun.arena) {
         sRun.wavesLeft = WavesForFloor(sRun.floor) + 2;
+    }
+    if (sRun.miniBoss) {
+        sRun.wavesLeft = 1; // just the mini-boss itself
     }
     if (sRun.expectedScene >= 0 && sceneNum != sRun.expectedScene) {
         sRun.fled = true;
@@ -2341,6 +2416,9 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     auto addTwist = [&twist](const std::string& part) { twist += (twist.empty() ? "" : ", ") + part; };
     if (sRun.bossFloor) {
         addTwist("Boss floor");
+    }
+    if (sRun.miniBoss) {
+        addTwist(std::string("Mini-boss: ") + sMiniBossSets[sRun.miniBossSet].name);
     }
     if (sRun.arena) {
         addTwist("Arena");

@@ -1951,8 +1951,10 @@ void SohMenu::AddMenuEnhancements() {
         .CVar(CVAR_ENHANCEMENT("Roguelike.BossFloors"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "Every few floors is a boss fight. Only bosses you can beat with your current gear are picked "
-            "(Volvagia always; others need the bow, bombs, hookshot or Mirror Shield). Beating one gives a heart "
-            "container, a full heal, a bonus upgrade and a choice of three items."));
+            "(Gohma, Phantom Ganon and Bongo Bongo need the bow, King Dodongo bombs, Volvagia the hammer, Morpha "
+            "the hookshot, Twinrova the Mirror Shield). If none can be beaten yet, you face a mini-boss instead "
+            "(Iron Knuckle, Stalfos, Dinolfos, Dark Link or Flare Dancer). Winning gives a heart container, a full "
+            "heal, a bonus upgrade and a choice of three items."));
     AddWidget(path, "Boss Every %d Floors", WIDGET_CVAR_SLIDER_INT)
         .CVar(CVAR_ENHANCEMENT("Roguelike.BossEvery"))
         .PreFunc([](WidgetInfo& info) {
