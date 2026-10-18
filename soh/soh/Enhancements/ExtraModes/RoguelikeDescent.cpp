@@ -1530,6 +1530,37 @@ static void OnLoadGameRoguelike(int32_t fileNum) {
 // Public API (used by the menu and by Autosave)
 // ---------------------------------------------------------------------------------------------------------------------
 
+// Shows Link's level/XP and the floor along the bottom of the pause screen while a run is active.
+extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
+    // Only on the main pause screen (not while it opens/closes or on the save prompt).
+    if (!sRun.active || play == NULL || play->pauseCtx.state != 6 || play->pauseCtx.debugState != 0) {
+        return;
+    }
+
+    std::string levelText = "Level " + std::to_string(sRun.level);
+    if (sRun.level < MAX_LEVEL) {
+        levelText += "  XP " + std::to_string(sRun.xp) + "/" + std::to_string(XpForNextLevel(sRun.level));
+    } else {
+        levelText += "  (max)";
+    }
+    std::string floorText = "Floor " + std::to_string(sRun.floor) + "  Best " +
+                            std::to_string(std::max(sRun.floor, CVarGetInteger(ROGUELIKE_BEST_FLOOR_CVAR, 0)));
+
+    u8 alpha = (u8)std::min<u16>(play->pauseCtx.alpha, 255);
+
+    OPEN_DISPS(play->state.gfxCtx);
+    Gfx_SetupDL_39Opa(play->state.gfxCtx);
+    gDPSetAlphaDither(POLY_OPA_DISP++, G_AD_DISABLE);
+    gSPClearGeometryMode(POLY_OPA_DISP++, G_SHADE);
+    gDPSetCombineLERP(POLY_OPA_DISP++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, PRIMITIVE, TEXEL0, 0,
+                      PRIMITIVE, 0);
+    CLOSE_DISPS(play->state.gfxCtx);
+
+    // Left: level (gold). Right: floor (white).
+    Interface_DrawTextLine(play->state.gfxCtx, (char*)levelText.c_str(), 40, 222, 255, 220, 100, alpha, 0.75f, 1);
+    Interface_DrawTextLine(play->state.gfxCtx, (char*)floorText.c_str(), 190, 222, 255, 255, 255, alpha, 0.75f, 1);
+}
+
 extern "C" bool Roguelike_IsRunActive() {
     return sRun.active;
 }

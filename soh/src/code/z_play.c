@@ -1284,6 +1284,8 @@ skip:
                        play->state.gfxCtx);
 }
 
+void Roguelike_DrawPauseInfo(PlayState* play);
+
 void Play_DrawOverlayElements(PlayState* play) {
     if ((play->pauseCtx.state != 0) || (play->pauseCtx.debugState != 0)) {
         KaleidoScopeCall_Draw(play);
@@ -1292,6 +1294,9 @@ void Play_DrawOverlayElements(PlayState* play) {
     if (gSaveContext.gameMode == GAMEMODE_NORMAL) {
         Interface_Draw(play);
     }
+
+    // SOH [Enhancement] Roguelike Descent: level and floor on the pause screen
+    Roguelike_DrawPauseInfo(play);
 
     Message_Draw(play);
 
