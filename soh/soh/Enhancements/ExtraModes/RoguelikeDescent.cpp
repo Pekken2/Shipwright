@@ -41,6 +41,7 @@ extern "C" {
 #include "macros.h"
 #include "functions.h"
 #include "variables.h"
+#include "src/overlays/actors/ovl_En_Box/z_en_box.h"
 extern PlayState* gPlayState;
 }
 
@@ -50,6 +51,7 @@ extern PlayState* gPlayState;
 #define ROGUELIKE_ROOM_TIME_LIMIT CVarGetInteger(CVAR_ROGUELIKE("RoomTimeLimit"), 120)
 #define ROGUELIKE_REWARD_EVERY CVarGetInteger(CVAR_ROGUELIKE("RewardEvery"), 2)
 #define ROGUELIKE_AUTO_RESTART CVarGetInteger(CVAR_ROGUELIKE("AutoRestart"), 0)
+#define ROGUELIKE_CHEST_CHANCE CVarGetInteger(CVAR_ROGUELIKE("ChestChance"), 35)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -58,6 +60,8 @@ static constexpr int WAVE_SPAWN_DELAY = 25;  // frames after landing before the 
 static constexpr int CLEAR_CHECK_DELAY = 45; // frames after landing before a room can count as cleared
 static constexpr int DESCEND_DELAY = 3 * FRAMES_PER_SECOND;
 static constexpr int RUN_OVER_DELAY = 3 * FRAMES_PER_SECOND;
+static constexpr int CHEST_WAIT_LIMIT = 60 * FRAMES_PER_SECOND; // descend anyway if a chest is ignored this long
+static constexpr s32 CHEST_NONE = -1;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Data tables
@@ -187,6 +191,7 @@ static struct {
     int roomFrames;
     int stateFrames;
     int wavesLeft;
+    s32 chestFlag; // treasure flag of the reward chest waiting to be opened, or CHEST_NONE
 } sRun;
 
 static SaveContext sSnapshot;
@@ -619,36 +624,81 @@ static void GiveRoomClearRefill(PlayState* play) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Enemy waves
+// Reward chests
 // ---------------------------------------------------------------------------------------------------------------------
 
-static int WavesForFloor(int floor) {
-    if (floor >= 12) {
-        return 3;
+// Major chest items, reusing the reward availability rules. Rewards with no vanilla get-item (magic meter, double
+// defense) are left to the floor rewards.
+static GetItemID RewardToGetItem(RoguelikeReward reward) {
+    switch (reward) {
+        case REWARD_HEART_CONTAINER:
+            return GI_HEART_CONTAINER_2;
+        case REWARD_BOW:
+            return GI_BOW;
+        case REWARD_HOOKSHOT:
+            return GI_HOOKSHOT;
+        case REWARD_LONGSHOT:
+            return GI_LONGSHOT;
+        case REWARD_BOMB_BAG:
+            return GI_BOMB_BAG_20;
+        case REWARD_HAMMER:
+            return GI_HAMMER;
+        case REWARD_DINS_FIRE:
+            return GI_DINS_FIRE;
+        case REWARD_NAYRUS_LOVE:
+            return GI_NAYRUS_LOVE;
+        case REWARD_FIRE_ARROWS:
+            return GI_ARROW_FIRE;
+        case REWARD_ICE_ARROWS:
+            return GI_ARROW_ICE;
+        case REWARD_LIGHT_ARROWS:
+            return GI_ARROW_LIGHT;
+        case REWARD_MIRROR_SHIELD:
+            return GI_SHIELD_MIRROR;
+        case REWARD_BIGGORON_SWORD:
+            return GI_SWORD_BGS;
+        case REWARD_HOVER_BOOTS:
+            return GI_BOOTS_HOVER;
+        default:
+            return GI_NONE;
     }
-    if (floor >= 5) {
-        return 2;
+}
+
+// Picks the chest's contents. Returns true for a "major" item (shown in a big chest).
+static GetItemID PickChestItem(bool* isMajor) {
+    std::vector<GetItemID> majors;
+    for (int reward = 0; reward < REWARD_MAX; reward++) {
+        GetItemID gi = RewardToGetItem((RoguelikeReward)reward);
+        if (gi != GI_NONE && IsRewardAvailable((RoguelikeReward)reward)) {
+            majors.push_back(gi);
+        }
     }
-    return 1;
+
+    if (!majors.empty() && RandInt(1, 100) <= 40) {
+        *isMajor = true;
+        return majors[RandInt(0, (int)majors.size() - 1)];
+    }
+
+    std::vector<GetItemID> minors = { GI_HEART_PIECE, GI_HEART_PIECE };
+    if (HasItem(ITEM_BOMB)) {
+        minors.push_back(GI_BOMBS_10);
+    }
+    if (HasItem(ITEM_BOW)) {
+        minors.push_back(GI_ARROWS_LARGE);
+    }
+    *isMajor = false;
+    return minors[RandInt(0, (int)minors.size() - 1)];
 }
 
-static int EnemiesPerWave(int floor) {
-    return std::min(2 + floor / 3, 6);
-}
-
-static int MaxTierForFloor(int floor) {
-    return std::min(1 + (floor - 1) / 4, NUM_ENEMY_TIERS);
-}
-
-// Finds a spot on the same floor as Link with no wall in between, so the enemy is reachable and in this room.
-static bool FindEnemySpawnSpot(PlayState* play, Vec3f* outPos) {
+// Finds a clear patch of floor on Link's level, in the given distance band, with no wall in between.
+static bool FindFloorSpotNearPlayer(PlayState* play, f32 minRadius, f32 maxRadius, Vec3f* outPos) {
     Player* player = GET_PLAYER(play);
     Vec3f origin = player->actor.world.pos;
     origin.y += 30.0f;
 
     for (int attempt = 0; attempt < 16; attempt++) {
         f32 angle = RandFloat(0.0f, 6.2831853f);
-        f32 radius = RandFloat(150.0f, 380.0f);
+        f32 radius = RandFloat(minRadius, maxRadius);
 
         Vec3f target = { origin.x + sinf(angle) * radius, origin.y, origin.z + cosf(angle) * radius };
         Vec3f hit;
@@ -671,6 +721,113 @@ static bool FindEnemySpawnSpot(PlayState* play, Vec3f* outPos) {
         return true;
     }
     return false;
+}
+
+// Maybe drops a treasure chest after a room is cleared. Returns true if one appeared.
+static bool TrySpawnRewardChest(PlayState* play) {
+    // Randomizer files map chests to seed locations, so chests are kept out of runs started on them.
+    if (IS_RANDO || RandInt(1, 100) > ROGUELIKE_CHEST_CHANCE) {
+        return false;
+    }
+
+    // Use a treasure flag that isn't already set in this dungeon, so the chest spawns closed.
+    s32 flag = CHEST_NONE;
+    for (s32 f = 31; f >= 0; f--) {
+        if (!Flags_GetTreasure(play, f)) {
+            flag = f;
+            break;
+        }
+    }
+    if (flag == CHEST_NONE) {
+        return false;
+    }
+
+    Vec3f pos;
+    if (!FindFloorSpotNearPlayer(play, 100.0f, 220.0f, &pos)) {
+        return false;
+    }
+
+    bool isMajor = false;
+    GetItemID item = PickChestItem(&isMajor);
+    Player* player = GET_PLAYER(play);
+    s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos); // open side faces Link
+
+    Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
+                               ENBOX_PARAMS(isMajor ? ENBOX_TYPE_BIG_DEFAULT : ENBOX_TYPE_SMALL, item, flag));
+    if (chest == NULL) {
+        return false;
+    }
+
+    sRun.chestFlag = flag;
+    Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
+    return true;
+}
+
+// Items picked up from chests get the same convenience treatment as floor rewards.
+static void OnItemReceiveRoguelike(GetItemEntry itemEntry) {
+    PlayState* play = gPlayState;
+    if (!sRun.active || play == NULL || itemEntry.modIndex != MOD_NONE) {
+        return;
+    }
+    Player* player = GET_PLAYER(play);
+
+    switch (itemEntry.itemId) {
+        case ITEM_BOW:
+        case ITEM_HOOKSHOT:
+        case ITEM_LONGSHOT:
+        case ITEM_HAMMER:
+        case ITEM_DINS_FIRE:
+        case ITEM_NAYRUS_LOVE:
+        case ITEM_ARROW_FIRE:
+        case ITEM_ARROW_ICE:
+        case ITEM_ARROW_LIGHT:
+            AssignToFreeCButton(play, itemEntry.itemId);
+            break;
+        case ITEM_BOMB_BAG_20:
+            AssignToFreeCButton(play, ITEM_BOMB);
+            break;
+        case ITEM_SHIELD_MIRROR:
+            SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_MIRROR);
+            Player_SetEquipmentData(play, player);
+            break;
+        case ITEM_SWORD_BGS:
+            gSaveContext.bgsFlag = true;
+            gSaveContext.swordHealth = 8;
+            gSaveContext.equips.buttonItems[0] = ITEM_SWORD_BGS;
+            SetEquipValue(EQUIP_TYPE_SWORD, EQUIP_VALUE_SWORD_BIGGORON);
+            Interface_LoadItemIcon1(play, 0);
+            Player_SetEquipmentData(play, player);
+            break;
+        default:
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Enemy waves
+// ---------------------------------------------------------------------------------------------------------------------
+
+static int WavesForFloor(int floor) {
+    if (floor >= 12) {
+        return 3;
+    }
+    if (floor >= 5) {
+        return 2;
+    }
+    return 1;
+}
+
+static int EnemiesPerWave(int floor) {
+    return std::min(2 + floor / 3, 6);
+}
+
+static int MaxTierForFloor(int floor) {
+    return std::min(1 + (floor - 1) / 4, NUM_ENEMY_TIERS);
+}
+
+// Enemies appear on Link's floor with no wall in between, so they are reachable and in this room.
+static bool FindEnemySpawnSpot(PlayState* play, Vec3f* outPos) {
+    return FindFloorSpotNearPlayer(play, 150.0f, 380.0f, outPos);
 }
 
 static void SpawnWave(PlayState* play) {
@@ -794,6 +951,7 @@ static void ResetRunState() {
     sRun.roomFrames = 0;
     sRun.stateFrames = 0;
     sRun.wavesLeft = 0;
+    sRun.chestFlag = CHEST_NONE;
 }
 
 static void StartRun(PlayState* play) {
@@ -902,6 +1060,7 @@ static void EnterRoomState(RoomState state) {
 static void OnRoomCleared(PlayState* play, bool timedOut) {
     EnterRoomState(ROOM_STATE_CLEARED);
     SaveBestFloor(sRun.floor);
+    sRun.chestFlag = CHEST_NONE;
 
     if (timedOut) {
         Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
@@ -917,6 +1076,10 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
         GiveRandomReward(play);
     } else {
         Notify("Floor " + std::to_string(sRun.floor) + " cleared!");
+    }
+
+    if (TrySpawnRewardChest(play)) {
+        Notify("A treasure chest appeared! ", "Open it to descend.");
     }
 }
 
@@ -990,7 +1153,22 @@ static void OnPlayerUpdateRoguelike() {
         }
 
         case ROOM_STATE_CLEARED:
-            if (sRun.stateFrames >= DESCEND_DELAY) {
+            if (sRun.chestFlag != CHEST_NONE) {
+                if (Flags_GetTreasure(play, sRun.chestFlag)) {
+                    // Opened. Free the flag again so it can't hide a real chest later, then wait for the item
+                    // fanfare to finish before descending.
+                    play->actorCtx.flags.chest &= ~(1u << sRun.chestFlag);
+                    sRun.chestFlag = CHEST_NONE;
+                    sRun.stateFrames = 0;
+                } else if (sRun.stateFrames >= CHEST_WAIT_LIMIT) {
+                    Notify("The chest sinks away...");
+                    sRun.chestFlag = CHEST_NONE;
+                    sRun.stateFrames = DESCEND_DELAY;
+                } else {
+                    break;
+                }
+            }
+            if (sRun.stateFrames >= DESCEND_DELAY && play->msgCtx.msgMode == MSGMODE_NONE && !Player_InCsMode(play)) {
                 GoToNextFloor(play);
             }
             break;
@@ -1079,6 +1257,7 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(AfterSceneCommands, true, PickRoomForPendingScene);
     COND_HOOK(OnPlayerHealthChange, true, OnPlayerHealthChangeRoguelike);
     COND_HOOK(OnLoadGame, true, OnLoadGameRoguelike);
+    COND_HOOK(OnItemReceive, true, OnItemReceiveRoguelike);
 
     // No saving during a run: the real save file stays untouched.
     COND_VB_SHOULD(VB_BE_ABLE_TO_SAVE, true, {

@@ -1921,17 +1921,27 @@ void SohMenu::AddMenuEnhancements() {
             "Heart containers Link starts each run with."));
     AddWidget(path, "Room Time Limit: %d seconds", WIDGET_CVAR_SLIDER_INT)
         .CVar(CVAR_ENHANCEMENT("Roguelike.RoomTimeLimit"))
-        .Options(IntSliderOptions().Min(0).Max(300).DefaultValue(120).Format("%d seconds").Tooltip(
-            "If a room isn't cleared in this time, the floor gives way and you descend without a reward. "
-            "This also rescues you from rooms with an enemy you can't reach. 0 = no limit."));
+        .Options(
+            IntSliderOptions()
+                .Min(0)
+                .Max(300)
+                .DefaultValue(120)
+                .Format("%d seconds")
+                .Tooltip("If a room isn't cleared in this time, the floor gives way and you descend without a reward. "
+                         "This also rescues you from rooms with an enemy you can't reach. 0 = no limit."));
     AddWidget(path, "Item Reward Every %d Floors", WIDGET_CVAR_SLIDER_INT)
         .CVar(CVAR_ENHANCEMENT("Roguelike.RewardEvery"))
         .Options(IntSliderOptions().Min(1).Max(5).DefaultValue(2).Format("%d").Tooltip(
             "How often clearing a floor gives a random item (bow, hookshot, magic, heart containers...)."));
+    AddWidget(path, "Treasure Chest Chance: %d%%", WIDGET_CVAR_SLIDER_INT)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.ChestChance"))
+        .Options(IntSliderOptions().Min(0).Max(100).DefaultValue(35).Format("%d%%").Tooltip(
+            "Chance that a treasure chest appears after clearing a room. Chests hold heart pieces, ammo, or "
+            "sometimes a major item like the Hookshot or Megaton Hammer. The floor waits for you to open it."));
     AddWidget(path, "Restart Run Automatically on Death", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.AutoRestart"))
-        .Options(CheckboxOptions().Tooltip(
-            "Immediately start a fresh run when you die instead of returning to your save."));
+        .Options(
+            CheckboxOptions().Tooltip("Immediately start a fresh run when you die instead of returning to your save."));
     AddWidget(path, "Shadow Tag Mode", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("ShadowTag"))
         .Options(CheckboxOptions().Tooltip("A Wallmaster follows Link everywhere, don't get caught!"));
