@@ -828,6 +828,10 @@ void RegisterOnUpdateMainMenuSelection() {
                 SpeechSynthesizer::Instance->Speak(translation.c_str(), GetLanguageCode());
                 break;
             }
+            case QUEST_ROGUELIKE: {
+                SpeechSynthesizer::Instance->Speak("Roguelike Descent", GetLanguageCode());
+                break;
+            }
             default:
                 break;
         }

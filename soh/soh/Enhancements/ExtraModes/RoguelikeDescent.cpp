@@ -708,7 +708,8 @@ static void TriggerTransition(PlayState* play, s32 entrance) {
     play->transitionType = TRANS_TYPE_FADE_BLACK;
 }
 
-static void GoToNextFloor(PlayState* play) {
+// Picks the next floor's dungeon and sets everything up for the room drop. Returns the entrance to load.
+static s32 PrepareNextFloor() {
     sRun.floor++;
 
     int unlocked = std::min((int)ARRAY_COUNT(sDungeons), 4 + ((sRun.floor - 1) / 3) * 2);
@@ -724,8 +725,12 @@ static void GoToNextFloor(PlayState* play) {
     sPendingScene = d.sceneNum;
     sRun.lastDungeon = dungeon;
 
-    TriggerTransition(play, d.entrance);
     Notify("Floor " + std::to_string(sRun.floor) + ": ", d.name);
+    return d.entrance;
+}
+
+static void GoToNextFloor(PlayState* play) {
+    TriggerTransition(play, PrepareNextFloor());
 }
 
 static void ApplyStartingLoadout() {
@@ -779,6 +784,18 @@ static void ApplyStartingLoadout() {
     gSaveContext.nayrusLoveTimer = 0;
 }
 
+static void ResetRunState() {
+    sRun.active = true;
+    sRun.floor = 0;
+    sRun.lastDungeon = 0;
+    sRun.lastScene = -1;
+    sRun.lastRoom = -1;
+    sRun.roomState = ROOM_STATE_ENTERING;
+    sRun.roomFrames = 0;
+    sRun.stateFrames = 0;
+    sRun.wavesLeft = 0;
+}
+
 static void StartRun(PlayState* play) {
     Player* player = GET_PLAYER(play);
 
@@ -791,18 +808,27 @@ static void StartRun(PlayState* play) {
         sReturnPoint.yaw = player->actor.shape.rot.y;
     }
 
-    sRun.active = true;
-    sRun.floor = 0;
-    sRun.lastDungeon = 0;
-    sRun.lastScene = -1;
-    sRun.lastRoom = -1;
-    sRun.roomState = ROOM_STATE_ENTERING;
-    sRun.roomFrames = 0;
-    sRun.stateFrames = 0;
-
+    ResetRunState();
     ApplyStartingLoadout();
     Notify("Roguelike run started. ", "Clear each room to descend!");
     GoToNextFloor(play);
+}
+
+// Roguelike Descent files (picked on the File Select quest screen) start a run straight from the file load:
+// no intro cutscene, and the first load goes directly into the first room.
+static void StartRunFromFileLoad() {
+    ResetRunState();
+    ApplyStartingLoadout();
+    // The file select screen has already set up the magic meter for the file's saved state; clear that out too.
+    gSaveContext.magicFillTarget = 0;
+    gSaveContext.magicCapacity = 0;
+
+    gSaveContext.entranceIndex = PrepareNextFloor();
+    gSaveContext.cutsceneIndex = 0;
+    gSaveContext.nextCutsceneIndex = 0xFFEF;
+    gSaveContext.respawnFlag = 0;
+    gSaveContext.dayTime = 0x8000; // noon
+    gSaveContext.nightFlag = 0;
 }
 
 static void SaveBestFloor(int floor) {
@@ -860,7 +886,8 @@ static void OnRunOver(PlayState* play) {
     }
     Notify("Run over. ", result);
 
-    if (ROGUELIKE_AUTO_RESTART) {
+    // Roguelike Descent files have no "real" save to go back to, so they always roll straight into a new run.
+    if (IS_ROGUELIKE || ROGUELIKE_AUTO_RESTART) {
         StartRun(play);
     } else {
         EndRun(play);
@@ -916,7 +943,11 @@ static void OnPlayerUpdateRoguelike() {
         if (play->transitionTrigger == TRANS_TRIGGER_OFF) {
             SaveBestFloor(sRun.floor);
             Notify("Run abandoned on floor ", std::to_string(sRun.floor));
-            EndRun(play);
+            if (IS_ROGUELIKE) {
+                StartRun(play); // nothing to return to on a Roguelike Descent file: start over
+            } else {
+                EndRun(play);
+            }
         }
         return;
     }
@@ -1008,6 +1039,10 @@ static void OnLoadGameRoguelike(int32_t fileNum) {
     sPendingRoomPick = false;
     sStartRequested = false;
     sAbandonRequested = false;
+
+    if (IS_ROGUELIKE) {
+        StartRunFromFileLoad();
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

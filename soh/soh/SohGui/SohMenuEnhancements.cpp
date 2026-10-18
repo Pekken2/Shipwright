@@ -837,6 +837,12 @@ void SohMenu::AddMenuEnhancements() {
         .PreFunc(HideQuestPreFunc(QUEST_SPEEDRUN_MASTER))
         .Options(CheckboxOptions().Tooltip(
             "Hides the Speedrun Master Quest option when selecting a quest type on the File Select screen."));
+    AddWidget(path, "Hide Roguelike Descent", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("FileSelect.HideRoguelikeQuest"))
+        .RaceDisable(false)
+        .PreFunc(HideQuestPreFunc(QUEST_ROGUELIKE))
+        .Options(CheckboxOptions().Tooltip(
+            "Hides the Roguelike Descent option when selecting a quest type on the File Select screen."));
 
     path.column = SECTION_COLUMN_3;
     AddWidget(path, "Misc.", WIDGET_SEPARATOR_TEXT);
@@ -1899,7 +1905,8 @@ void SohMenu::AddMenuEnhancements() {
     AddWidget(path, "Abandon Run", WIDGET_BUTTON)
         .Callback([](WidgetInfo& info) { Roguelike_RequestAbandonRun(); })
         .PreFunc([](WidgetInfo& info) { info.isHidden = !Roguelike_IsRunActive(); })
-        .Options(ButtonOptions().Tooltip("End the current run and return to where you started it."));
+        .Options(ButtonOptions().Tooltip("End the current run and return to where you started it. On a Roguelike "
+                                         "Descent file, this starts a fresh run instead."));
     AddWidget(path, "Roguelike Status", WIDGET_TEXT).PreFunc([](WidgetInfo& info) {
         if (Roguelike_IsRunActive()) {
             info.name = "Floor " + std::to_string(Roguelike_GetCurrentFloor()) +

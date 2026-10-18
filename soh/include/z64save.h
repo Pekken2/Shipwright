@@ -406,6 +406,7 @@ typedef enum {
     /* 03 */ QUEST_BOSSRUSH,
     /* 04 */ QUEST_SPEEDRUN,
     /* 05 */ QUEST_SPEEDRUN_MASTER,
+    /* 06 */ QUEST_ROGUELIKE,
 } Quest;
 
 #define IS_VANILLA (gSaveContext.ship.quest.id == QUEST_NORMAL || gSaveContext.ship.quest.id == QUEST_SPEEDRUN)
@@ -413,6 +414,7 @@ typedef enum {
     (gSaveContext.ship.quest.id == QUEST_MASTER || gSaveContext.ship.quest.id == QUEST_SPEEDRUN_MASTER)
 #define IS_RANDO (gSaveContext.ship.quest.id == QUEST_RANDOMIZER)
 #define IS_BOSS_RUSH (gSaveContext.ship.quest.id == QUEST_BOSSRUSH)
+#define IS_ROGUELIKE (gSaveContext.ship.quest.id == QUEST_ROGUELIKE)
 #define IS_SPEEDRUN \
     (gSaveContext.ship.quest.id == QUEST_SPEEDRUN || gSaveContext.ship.quest.id == QUEST_SPEEDRUN_MASTER)
 

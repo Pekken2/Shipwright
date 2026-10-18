@@ -86,6 +86,8 @@ bool SohFileSelect_IsQuestHidden(u8 quest) {
         case QUEST_SPEEDRUN_MASTER:
             return !ResourceMgr_GameHasMasterQuest() ||
                    CVarGetInteger(CVAR_ENHANCEMENT("FileSelect.HideSpeedrunMasterQuest"), 0);
+        case QUEST_ROGUELIKE:
+            return CVarGetInteger(CVAR_ENHANCEMENT("FileSelect.HideRoguelikeQuest"), 0);
         default:
             return false;
     }
@@ -93,7 +95,7 @@ bool SohFileSelect_IsQuestHidden(u8 quest) {
 
 u8 SohFileSelect_CountVisibleQuests() {
     u8 count = 0;
-    for (u8 quest = QUEST_NORMAL; quest <= QUEST_SPEEDRUN_MASTER; ++quest) {
+    for (u8 quest = QUEST_NORMAL; quest <= QUEST_ROGUELIKE; ++quest) {
         if (!SohFileSelect_IsQuestHidden(quest)) {
             count++;
         }

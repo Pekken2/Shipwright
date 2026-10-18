@@ -731,6 +731,8 @@ void SaveManager::StartupCheckAndInitMeta(int fileNum) {
 
         if (fileType == FILE_TYPE_SAVE_SPEEDRUN) {
             fileMetaInfo[fileNum].quest = isMasterQuest ? QUEST_SPEEDRUN_MASTER : QUEST_SPEEDRUN;
+        } else if (fileType == FILE_TYPE_SAVE_ROGUELIKE) {
+            fileMetaInfo[fileNum].quest = QUEST_ROGUELIKE;
         } else {
             fileMetaInfo[fileNum].quest = isMasterQuest ? QUEST_MASTER : QUEST_NORMAL;
         }
@@ -1259,6 +1261,8 @@ void SaveManager::SaveFileThreaded(int fileNum, const SaveContext& saveContext, 
         saveBlock["fileType"] = FILE_TYPE_SAVE_RANDO;
     } else if (IS_SPEEDRUN) {
         saveBlock["fileType"] = FILE_TYPE_SAVE_SPEEDRUN;
+    } else if (saveContext.ship.quest.id == QUEST_ROGUELIKE) {
+        saveBlock["fileType"] = FILE_TYPE_SAVE_ROGUELIKE;
     } else {
         saveBlock["fileType"] = FILE_TYPE_SAVE_VANILLA;
     }
@@ -1367,6 +1371,8 @@ void SaveManager::LoadFile(int fileNum) {
         } else if (fileType == FILE_TYPE_SAVE_SPEEDRUN) {
             // The base section changes this to QUEST_SPEEDRUN_MASTER for master quest files.
             gSaveContext.ship.quest.id = QUEST_SPEEDRUN;
+        } else if (fileType == FILE_TYPE_SAVE_ROGUELIKE) {
+            gSaveContext.ship.quest.id = QUEST_ROGUELIKE;
         }
         switch (saveBlock["version"].get<int>()) {
             case 1:

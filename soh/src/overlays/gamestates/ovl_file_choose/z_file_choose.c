@@ -29,7 +29,7 @@
 #include <libultraship/bridge/consolevariablebridge.h>
 
 #define MIN_QUEST (ResourceMgr_GameHasOriginal() ? QUEST_NORMAL : QUEST_MASTER)
-#define MAX_QUEST QUEST_SPEEDRUN_MASTER
+#define MAX_QUEST QUEST_ROGUELIKE
 
 // #region SOH [Enhancement] - Hide Quest Modes
 // Step from quest in the given direction (1 or -1) to the next visible quest, wrapping around at the ends
@@ -2019,6 +2019,20 @@ void FileChoose_DrawWindowContents(GameState* thisx) {
                                                                                                    : "Speedrun",
                                        130, 176, 255, 255, 255, this->logoAlpha, 1.0f, true);
                 break;
+
+            case QUEST_ROGUELIKE:
+                gDPSetPrimColor(POLY_OPA_DISP++, 0, 0, 255, 255, 255, this->logoAlpha);
+                FileChoose_DrawTextureI8(this->state.gfxCtx, gTitleTheLegendOfTextTex, 72, 8, 156, 108, 72, 8, 1024,
+                                         1024);
+                FileChoose_DrawTextureI8(this->state.gfxCtx, gTitleOcarinaOfTimeTMTextTex, 96, 8, 154, 163, 96, 8, 1024,
+                                         1024);
+                FileChoose_DrawImageRGBA32(
+                    this->state.gfxCtx, 160, 135,
+                    ResourceMgr_GameHasOriginal() ? gTitleZeldaShieldLogoTex : gTitleZeldaShieldLogoMQTex, 160, 160);
+                // No subtitle texture exists for this mode, so the name is drawn as text instead.
+                Interface_DrawTextLine(this->state.gfxCtx, "Roguelike Descent", 130, 176, 255, 255, 255,
+                                       this->logoAlpha, 1.0f, true);
+                break;
         }
     } else if (this->configMode == CM_BOSS_RUSH_MENU) {
         FileChoose_DrawBossRushMenuWindowContents(this);
@@ -2159,6 +2173,9 @@ void FileChoose_DrawWindowContents(GameState* thisx) {
                     break;
                 case QUEST_MASTER:
                     questLabelText = "MQ";
+                    break;
+                case QUEST_ROGUELIKE:
+                    questLabelText = "RGL";
                     break;
             }
             if (!Save_GetSaveMetaInfo(i)->valid) {
