@@ -32,7 +32,9 @@
 #include <string>
 #include <vector>
 
+#include "soh/Enhancements/cosmetics/authenticGfxPatches.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
+#include "soh/ObjectExtension/ActorMaximumHealth.h"
 #include "soh/Notification/Notification.h"
 #include "soh/SohGui/ImGuiUtils.h"
 #include "soh/ShipInit.hpp"
@@ -54,6 +56,9 @@ extern PlayState* gPlayState;
 #define ROGUELIKE_AUTO_RESTART CVarGetInteger(CVAR_ROGUELIKE("AutoRestart"), 0)
 #define ROGUELIKE_CHEST_CHANCE CVarGetInteger(CVAR_ROGUELIKE("ChestChance"), 35)
 #define ROGUELIKE_ELITES CVarGetInteger(CVAR_ROGUELIKE("Elites"), 1)
+#define ROGUELIKE_BOSS_FLOORS CVarGetInteger(CVAR_ROGUELIKE("BossFloors"), 1)
+#define ROGUELIKE_BOSS_EVERY CVarGetInteger(CVAR_ROGUELIKE("BossEvery"), 5)
+#define ROGUELIKE_MODIFIERS CVarGetInteger(CVAR_ROGUELIKE("Modifiers"), 1)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -174,7 +179,19 @@ typedef enum {
     ROOM_STATE_FIGHTING, // enemies are alive
     ROOM_STATE_CLEARED,  // counting down to the next floor
     ROOM_STATE_RUN_OVER, // Link died, counting down to the end of the run
+    ROOM_STATE_BOSS,     // boss floor: waiting for the boss to fall
 } RoomState;
+
+typedef enum {
+    FLOORMOD_NONE,
+    FLOORMOD_MIRROR,       // the world is mirrored
+    FLOORMOD_GIANT,        // enemies are huge and tougher, 1.5x XP
+    FLOORMOD_GLASS_CANNON, // everyone deals double damage
+    FLOORMOD_SWARM,        // twice the enemies
+    FLOORMOD_ELITE,        // every enemy is an elite
+    FLOORMOD_HASTY,        // short room timer, double XP
+    FLOORMOD_MAX,
+} FloorModifier;
 
 typedef struct {
     s32 entranceIndex;
@@ -196,6 +213,10 @@ static struct {
     s32 chestFlag; // treasure flag of the reward chest waiting to be opened, or CHEST_NONE
     int level;     // Link's level this run
     int xp;        // XP towards the next level
+    bool bossFloor;
+    bool bossDefeated;
+    int bossWaitFrames;     // frames since the boss fell, so its death scene can play out
+    FloorModifier modifier; // this floor's twist, if any
 } sRun;
 
 static SaveContext sSnapshot;
@@ -728,6 +749,8 @@ static bool FindFloorSpotNearPlayer(PlayState* play, f32 minRadius, f32 maxRadiu
 }
 
 // Maybe drops a treasure chest after a room is cleared. Returns true if one appeared.
+static s32 FindFreeTreasureFlag(PlayState* play);
+
 static bool TrySpawnRewardChest(PlayState* play) {
     // Randomizer files map chests to seed locations, so chests are kept out of runs started on them.
     if (IS_RANDO || RandInt(1, 100) > ROGUELIKE_CHEST_CHANCE) {
@@ -735,13 +758,7 @@ static bool TrySpawnRewardChest(PlayState* play) {
     }
 
     // Use a treasure flag that isn't already set in this dungeon, so the chest spawns closed.
-    s32 flag = CHEST_NONE;
-    for (s32 f = 31; f >= 0; f--) {
-        if (!Flags_GetTreasure(play, f)) {
-            flag = f;
-            break;
-        }
-    }
+    s32 flag = FindFreeTreasureFlag(play);
     if (flag == CHEST_NONE) {
         return false;
     }
@@ -776,6 +793,22 @@ static void OnItemReceiveRoguelike(GetItemEntry itemEntry) {
     Player* player = GET_PLAYER(play);
 
     switch (itemEntry.itemId) {
+        case ITEM_DINS_FIRE:
+        case ITEM_NAYRUS_LOVE:
+        case ITEM_ARROW_FIRE:
+        case ITEM_ARROW_ICE:
+        case ITEM_ARROW_LIGHT:
+            // Magic items are useless without a meter, so the first one brings it along.
+            if (!gSaveContext.isMagicAcquired) {
+                GiveMagic(play, false);
+                Notify("Magic meter unlocked!");
+            }
+            break;
+        default:
+            break;
+    }
+
+    switch (itemEntry.itemId) {
         case ITEM_BOW:
         case ITEM_HOOKSHOT:
         case ITEM_LONGSHOT:
@@ -808,6 +841,200 @@ static void OnItemReceiveRoguelike(GetItemEntry itemEntry) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Pick 1 of 3: reward floors put down a row of big chests; opening one makes the others vanish.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static constexpr int MAX_CHOICE_CHESTS = 3;
+
+typedef struct {
+    Actor* actor;
+    s32 flag;
+} ChoiceChest;
+
+static ChoiceChest sChoiceChests[MAX_CHOICE_CHESTS];
+static int sChoiceCount = 0;
+
+// Chest rewards can be offered a bit more freely than direct rewards: spells and magic arrows bring a magic meter
+// with them if Link doesn't have one yet (see OnItemReceiveRoguelike).
+static bool IsChestRewardAvailable(RoguelikeReward reward) {
+    switch (reward) {
+        case REWARD_DINS_FIRE:
+            return !HasItem(ITEM_DINS_FIRE);
+        case REWARD_NAYRUS_LOVE:
+            return !HasItem(ITEM_NAYRUS_LOVE);
+        case REWARD_FIRE_ARROWS:
+            return HasItem(ITEM_BOW) && !HasItem(ITEM_ARROW_FIRE);
+        case REWARD_ICE_ARROWS:
+            return HasItem(ITEM_BOW) && !HasItem(ITEM_ARROW_ICE);
+        case REWARD_LIGHT_ARROWS:
+            return HasItem(ITEM_BOW) && !HasItem(ITEM_ARROW_LIGHT);
+        default:
+            return IsRewardAvailable(reward);
+    }
+}
+
+// A treasure flag that is unset in this scene and not already used by one of our chests.
+static s32 FindFreeTreasureFlag(PlayState* play) {
+    for (s32 f = 31; f >= 0; f--) {
+        bool taken = Flags_GetTreasure(play, f) || f == sRun.chestFlag;
+        for (int i = 0; i < sChoiceCount; i++) {
+            taken = taken || sChoiceChests[i].flag == f;
+        }
+        if (!taken) {
+            return f;
+        }
+    }
+    return CHEST_NONE;
+}
+
+// Is there floor at about Link's height at `target`, with no wall between Link and it?
+static bool IsReachableFloorSpot(PlayState* play, Vec3f target, Vec3f* outPos) {
+    Player* player = GET_PLAYER(play);
+    Vec3f origin = player->actor.world.pos;
+    origin.y += 30.0f;
+    target.y = origin.y;
+
+    Vec3f hit;
+    CollisionPoly* wallPoly = NULL;
+    s32 bgId;
+    if (BgCheck_EntityLineTest1(&play->colCtx, &origin, &target, &hit, &wallPoly, true, false, false, true, &bgId)) {
+        return false;
+    }
+    Vec3f probe = target;
+    probe.y += 50.0f;
+    CollisionPoly* floorPoly = NULL;
+    f32 floorY = BgCheck_EntityRaycastFloor1(&play->colCtx, &floorPoly, &probe);
+    if (floorPoly == NULL || floorY <= BGCHECK_Y_MIN + 1.0f || fabsf(floorY - player->actor.world.pos.y) > 60.0f) {
+        return false;
+    }
+    *outPos = { target.x, floorY, target.z };
+    return true;
+}
+
+static Actor* SpawnChest(PlayState* play, Vec3f pos, GetItemID item, bool big, s32 flag) {
+    Player* player = GET_PLAYER(play);
+    s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos); // open side faces Link
+    return Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
+                       (s16)ENBOX_PARAMS(big ? ENBOX_TYPE_BIG_DEFAULT : ENBOX_TYPE_SMALL, item, flag));
+}
+
+// Puts down up to three big chests with different major items. Returns false if there aren't at least two
+// different items to choose from, or nowhere to put them (the caller then hands out a direct reward instead).
+static bool SpawnRewardChoice(PlayState* play) {
+    if (IS_RANDO) {
+        return false;
+    }
+
+    std::vector<GetItemID> items;
+    for (int reward = 0; reward < REWARD_MAX; reward++) {
+        GetItemID gi = RewardToGetItem((RoguelikeReward)reward);
+        if (gi != GI_NONE && IsChestRewardAvailable((RoguelikeReward)reward)) {
+            items.push_back(gi);
+        }
+    }
+    std::shuffle(items.begin(), items.end(), sRng);
+    int count = std::min((int)items.size(), MAX_CHOICE_CHESTS);
+    if (count < 2) {
+        return false;
+    }
+
+    // Lay them out in a row in front of Link.
+    Player* player = GET_PLAYER(play);
+    f32 fwdX = Math_SinS(player->actor.shape.rot.y);
+    f32 fwdZ = Math_CosS(player->actor.shape.rot.y);
+    Vec3f center = { player->actor.world.pos.x + fwdX * 150.0f, player->actor.world.pos.y,
+                     player->actor.world.pos.z + fwdZ * 150.0f };
+    static const f32 sOffsets3[] = { -120.0f, 0.0f, 120.0f };
+    static const f32 sOffsets2[] = { -75.0f, 75.0f };
+
+    std::vector<Vec3f> placed;
+    sChoiceCount = 0;
+    for (int i = 0; i < count; i++) {
+        f32 offset = (count == 3) ? sOffsets3[i] : sOffsets2[i];
+        Vec3f target = { center.x + fwdZ * offset, center.y, center.z - fwdX * offset };
+        Vec3f pos;
+        bool found = IsReachableFloorSpot(play, target, &pos);
+
+        // Fall back to any clear spot that isn't on top of another chest.
+        for (int attempt = 0; !found && attempt < 10; attempt++) {
+            if (FindFloorSpotNearPlayer(play, 110.0f, 260.0f, &pos)) {
+                found = true;
+                for (const Vec3f& other : placed) {
+                    if (Math_Vec3f_DistXZ(&pos, (Vec3f*)&other) < 100.0f) {
+                        found = false;
+                    }
+                }
+            }
+        }
+        if (!found) {
+            continue;
+        }
+
+        s32 flag = FindFreeTreasureFlag(play);
+        if (flag == CHEST_NONE) {
+            break;
+        }
+        Actor* chest = SpawnChest(play, pos, items[i], true, flag);
+        if (chest != NULL) {
+            sChoiceChests[sChoiceCount++] = { chest, flag };
+            placed.push_back(pos);
+        }
+    }
+
+    if (sChoiceCount < 2) {
+        // Not enough room for a real choice; take back what was placed and let the caller give a direct reward.
+        for (int i = 0; i < sChoiceCount; i++) {
+            Actor_Kill(sChoiceChests[i].actor);
+        }
+        sChoiceCount = 0;
+        return false;
+    }
+
+    Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
+    return true;
+}
+
+// Makes every choice chest except `keep` vanish in a puff of smoke.
+static void RemoveChoiceChests(PlayState* play, Actor* keep) {
+    for (int i = 0; i < sChoiceCount; i++) {
+        Actor* chest = sChoiceChests[i].actor;
+        if (chest == NULL || chest == keep) {
+            continue;
+        }
+        Vec3f pos = chest->world.pos;
+        pos.y += 20.0f;
+        Vec3f zero = { 0.0f, 0.0f, 0.0f };
+        EffectSsDeadDb_Spawn(play, &pos, &zero, &zero, 120, 0, 255, 255, 255, 255, 0, 0, 255, 1, 9, true);
+        Actor_Kill(chest);
+        sChoiceChests[i].actor = NULL;
+    }
+}
+
+// Returns true while the choice is still waiting to be made.
+static bool UpdateRewardChoice(PlayState* play) {
+    if (sChoiceCount == 0) {
+        return false;
+    }
+    for (int i = 0; i < sChoiceCount; i++) {
+        if (Flags_GetTreasure(play, sChoiceChests[i].flag)) {
+            RemoveChoiceChests(play, sChoiceChests[i].actor);
+            play->actorCtx.flags.chest &= ~(1u << sChoiceChests[i].flag); // free it for later
+            sChoiceCount = 0;
+            sRun.stateFrames = 0; // let the item fanfare finish before descending
+            return false;
+        }
+    }
+    if (sRun.stateFrames >= CHEST_WAIT_LIMIT) {
+        RemoveChoiceChests(play, NULL);
+        sChoiceCount = 0;
+        Notify("The chests sink away...");
+        sRun.stateFrames = DESCEND_DELAY;
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Enemy waves
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -822,7 +1049,11 @@ static int WavesForFloor(int floor) {
 }
 
 static int EnemiesPerWave(int floor) {
-    return std::min(2 + floor / 3, 6);
+    int count = std::min(2 + floor / 3, 6);
+    if (sRun.modifier == FLOORMOD_SWARM) {
+        count = std::min(count * 2, 10);
+    }
+    return count;
 }
 
 static int MaxTierForFloor(int floor) {
@@ -961,6 +1192,12 @@ static void SetUpEnemy(Actor* actor) {
     info.affix = AFFIX_NONE;
 
     int eliteChance = std::min(8 + sRun.floor * 4, 60);
+    if (sRun.modifier == FLOORMOD_ELITE) {
+        eliteChance = 100;
+    }
+    if (sRun.bossFloor) {
+        eliteChance = 0; // boss fights are hard enough
+    }
     if (ROGUELIKE_ELITES && RandInt(1, 100) <= eliteChance) {
         info.affix = (EnemyAffix)RandInt(AFFIX_FIRE, AFFIX_MAX - 1);
         info.level += 2;
@@ -971,8 +1208,15 @@ static void SetUpEnemy(Actor* actor) {
     if (info.affix != AFFIX_NONE) {
         healthScale *= 1.5f;
     }
+    // Giants: bigger and tougher. A few enemies only work at their normal size (same list as Enemy Sizes).
+    bool canGrow = actor->id != ACTOR_EN_BROB && actor->id != ACTOR_EN_DHA && actor->id != ACTOR_EN_DH;
+    if (sRun.modifier == FLOORMOD_GIANT && canGrow) {
+        Actor_SetScale(actor, actor->scale.z * 1.6f);
+        healthScale *= 1.3f;
+    }
     int health = (int)lroundf(actor->colChkInfo.health * healthScale);
     actor->colChkInfo.health = (u8)std::clamp(health, 1, 255);
+    SetActorMaximumHealth(actor, actor->colChkInfo.health); // keeps enemy health bars right
     info.prevHealth = actor->colChkInfo.health;
 
     sEnemies[actor] = info;
@@ -1015,7 +1259,8 @@ static void OnActorUpdateRoguelike(void* refActor) {
     u8 health = actor->colChkInfo.health;
     if (health < info.prevHealth && health > 0) {
         int dealt = info.prevHealth - health;
-        int extra = (dealt * PlayerDamageBonusPct(sRun.level) + 50) / 100;
+        int bonusPct = PlayerDamageBonusPct(sRun.level) + (sRun.modifier == FLOORMOD_GLASS_CANNON ? 100 : 0);
+        int extra = (dealt * bonusPct + 50) / 100;
         if (extra > 0) {
             actor->colChkInfo.health = (u8)std::max(1, (int)health - extra);
         }
@@ -1029,6 +1274,11 @@ static void OnActorUpdateRoguelike(void* refActor) {
 
 static void OnActorDestroyRoguelike(void* refActor) {
     sEnemies.erase((Actor*)refActor);
+    for (int i = 0; i < sChoiceCount; i++) {
+        if (sChoiceChests[i].actor == refActor) {
+            sChoiceChests[i].actor = NULL;
+        }
+    }
 }
 
 static void OnEnemyDefeatRoguelike(void* refActor) {
@@ -1048,6 +1298,11 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     int xp = 10 + 5 * level;
     if (elite) {
         xp *= 2;
+    }
+    if (sRun.modifier == FLOORMOD_HASTY) {
+        xp *= 2;
+    } else if (sRun.modifier == FLOORMOD_GIANT) {
+        xp = xp * 3 / 2;
     }
     GainXp(play, xp);
 }
@@ -1078,6 +1333,9 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
     }
     int taken = -amount;
     f32 scaled = taken * EnemyDamageMultiplier(sRun.floor) * (1.0f - PlayerDefensePct(sRun.level) / 100.0f);
+    if (sRun.modifier == FLOORMOD_GLASS_CANNON) {
+        scaled *= 2.0f;
+    }
     int finalDamage = std::max(1, (int)lroundf(scaled));
     int delta = finalDamage - taken; // positive: extra damage, negative: damage refunded
     gSaveContext.health = (s16)std::clamp(gSaveContext.health - delta, -1, (int)gSaveContext.healthCapacity);
@@ -1146,6 +1404,129 @@ static void UpdateLeveling(PlayState* play) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Boss floors and floor modifiers
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef struct {
+    s16 sceneNum;
+    s32 entrance;
+    const char* name;
+    u8 tunic;
+    bool (*canFight)(); // adult Link needs certain gear to be able to win
+} RoguelikeBoss;
+
+static bool BossNeedsNothing() {
+    return true;
+}
+static bool BossNeedsBow() {
+    return HasItem(ITEM_BOW);
+}
+static bool BossNeedsBombs() {
+    return HasItem(ITEM_BOMB);
+}
+static bool BossNeedsHookshot() {
+    return INV_CONTENT(ITEM_HOOKSHOT) != ITEM_NONE;
+}
+static bool BossNeedsMirrorShield() {
+    return CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_MIRROR);
+}
+
+static const RoguelikeBoss sBosses[] = {
+    { SCENE_FIRE_TEMPLE_BOSS, ENTR_FIRE_TEMPLE_BOSS_ENTRANCE, "Volvagia", EQUIP_VALUE_TUNIC_GORON, BossNeedsNothing },
+    { SCENE_DEKU_TREE_BOSS, ENTR_DEKU_TREE_BOSS_ENTRANCE, "Queen Gohma", EQUIP_VALUE_TUNIC_KOKIRI, BossNeedsBow },
+    { SCENE_DODONGOS_CAVERN_BOSS, ENTR_DODONGOS_CAVERN_BOSS_ENTRANCE, "King Dodongo", EQUIP_VALUE_TUNIC_GORON,
+      BossNeedsBombs },
+    { SCENE_FOREST_TEMPLE_BOSS, ENTR_FOREST_TEMPLE_BOSS_ENTRANCE, "Phantom Ganon", EQUIP_VALUE_TUNIC_KOKIRI,
+      BossNeedsBow },
+    { SCENE_WATER_TEMPLE_BOSS, ENTR_WATER_TEMPLE_BOSS_ENTRANCE, "Morpha", EQUIP_VALUE_TUNIC_KOKIRI, BossNeedsHookshot },
+    { SCENE_SHADOW_TEMPLE_BOSS, ENTR_SHADOW_TEMPLE_BOSS_ENTRANCE, "Bongo Bongo", EQUIP_VALUE_TUNIC_KOKIRI,
+      BossNeedsBow },
+    { SCENE_SPIRIT_TEMPLE_BOSS, ENTR_SPIRIT_TEMPLE_BOSS_2, "Twinrova", EQUIP_VALUE_TUNIC_KOKIRI,
+      BossNeedsMirrorShield },
+};
+
+static int sLastBoss = -1;
+
+static bool IsBossFloor(int floor) {
+    return ROGUELIKE_BOSS_FLOORS && floor > 0 && floor % std::max(2, ROGUELIKE_BOSS_EVERY) == 0;
+}
+
+static const char* sModifierNames[FLOORMOD_MAX] = {
+    "", "Mirror World", "Giants", "Glass Cannon", "Swarm", "Elite Floor", "Hasty",
+};
+static const char* sModifierDescriptions[FLOORMOD_MAX] = {
+    "",
+    "The world is flipped.",
+    "Enemies are huge and tougher. 1.5x XP.",
+    "You and the enemies deal double damage.",
+    "Twice as many enemies.",
+    "Every enemy is an elite.",
+    "45 seconds to clear the room. Double XP.",
+};
+
+static FloorModifier RollFloorModifier(int floor) {
+    if (!ROGUELIKE_MODIFIERS || floor < 2) {
+        return FLOORMOD_NONE;
+    }
+    int chance = std::min(15 + floor * 3, 50);
+    if (RandInt(1, 100) > chance) {
+        return FLOORMOD_NONE;
+    }
+    return (FloorModifier)RandInt(FLOORMOD_NONE + 1, FLOORMOD_MAX - 1);
+}
+
+// Mirror World borrows SoH's own Mirrored World switch for one floor, unless the player already has that mode on.
+static bool sMirrorApplied = false;
+static void SetRunMirror(bool on) {
+    if (CVarGetInteger(CVAR_ENHANCEMENT("MirroredWorldMode"), 0) != 0 || on == sMirrorApplied) {
+        return;
+    }
+    sMirrorApplied = on;
+    if (on) {
+        CVarSetInteger(CVAR_ENHANCEMENT("MirroredWorld"), 1);
+    } else {
+        CVarClear(CVAR_ENHANCEMENT("MirroredWorld"));
+    }
+    ApplyMirrorWorldGfxPatches();
+}
+
+// Sets up a boss floor. Returns the boss room entrance.
+static s32 PrepareBossFloor() {
+    std::vector<int> eligible;
+    for (int i = 0; i < (int)ARRAY_COUNT(sBosses); i++) {
+        if (sBosses[i].canFight()) {
+            eligible.push_back(i);
+        }
+    }
+    if (eligible.size() > 1) {
+        eligible.erase(std::remove(eligible.begin(), eligible.end(), sLastBoss), eligible.end());
+    }
+    int index = eligible[RandInt(0, (int)eligible.size() - 1)];
+    const RoguelikeBoss& boss = sBosses[index];
+    sLastBoss = index;
+
+    // Make sure the boss is there even if it was beaten before (in the real save or earlier this run).
+    memset(&gSaveContext.sceneFlags[boss.sceneNum], 0, sizeof(SavedSceneFlags));
+
+    SetEquipValue(EQUIP_TYPE_TUNIC, boss.tunic);
+    sPendingRoomPick = false;
+    sRun.bossFloor = true;
+    sRun.bossDefeated = false;
+    sRun.bossWaitFrames = 0;
+    sRun.modifier = FLOORMOD_NONE;
+
+    Notify("Floor " + std::to_string(sRun.floor) + ": BOSS - ", boss.name);
+    return boss.entrance;
+}
+
+static void OnBossDefeatRoguelike(void* refActor) {
+    if (sRun.active && sRun.bossFloor && !sRun.bossDefeated) {
+        sRun.bossDefeated = true;
+        sRun.bossWaitFrames = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Run flow
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -1161,13 +1542,20 @@ static void TriggerTransition(PlayState* play, s32 entrance) {
 static s32 PrepareNextFloor() {
     sRun.floor++;
 
+    // Wear the right tunic for the heat / water.
+    GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_GORON);
+    GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_ZORA);
+
+    if (IsBossFloor(sRun.floor)) {
+        return PrepareBossFloor();
+    }
+    sRun.bossFloor = false;
+    sRun.modifier = RollFloorModifier(sRun.floor);
+
     int unlocked = std::min((int)ARRAY_COUNT(sDungeons), 4 + ((sRun.floor - 1) / 3) * 2);
     int dungeon = RandInt(0, unlocked - 1);
     const RoguelikeDungeon& d = sDungeons[dungeon];
 
-    // Wear the right tunic for the heat / water.
-    GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_GORON);
-    GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_ZORA);
     SetEquipValue(EQUIP_TYPE_TUNIC, d.tunic);
 
     sPendingRoomPick = true;
@@ -1175,6 +1563,9 @@ static s32 PrepareNextFloor() {
     sRun.lastDungeon = dungeon;
 
     Notify("Floor " + std::to_string(sRun.floor) + ": ", d.name);
+    if (sRun.modifier != FLOORMOD_NONE) {
+        Notify(std::string(sModifierNames[sRun.modifier]) + "! ", sModifierDescriptions[sRun.modifier]);
+    }
     return d.entrance;
 }
 
@@ -1231,6 +1622,9 @@ static void ApplyStartingLoadout() {
     gSaveContext.bgsFlag = false;
     gSaveContext.rupees = 0;
     gSaveContext.nayrusLoveTimer = 0;
+
+    // Skip the boss intro cutscenes (same flags Boss Rush uses).
+    gSaveContext.eventChkInf[7] |= 0xFF;
 }
 
 static void ResetRunState() {
@@ -1244,6 +1638,12 @@ static void ResetRunState() {
     sRun.stateFrames = 0;
     sRun.wavesLeft = 0;
     sRun.chestFlag = CHEST_NONE;
+    sRun.bossFloor = false;
+    sRun.bossDefeated = false;
+    sRun.bossWaitFrames = 0;
+    sRun.modifier = FLOORMOD_NONE;
+    sLastBoss = -1;
+    sChoiceCount = 0;
     ResetLeveling();
 }
 
@@ -1366,13 +1766,51 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
 
     int every = std::max(1, ROGUELIKE_REWARD_EVERY);
     if (sRun.floor % every == 0) {
-        GiveRandomReward(play);
+        if (SpawnRewardChoice(play)) {
+            Notify("Choose your reward! ", "Open one chest - the others will vanish.");
+        } else {
+            GiveRandomReward(play);
+        }
     } else {
         Notify("Floor " + std::to_string(sRun.floor) + " cleared!");
     }
 
-    if (TrySpawnRewardChest(play)) {
+    if (sChoiceCount == 0 && TrySpawnRewardChest(play)) {
         Notify("A treasure chest appeared! ", "Open it to descend.");
+    }
+}
+
+// The boss is down and its death scene is over: big rewards, then the usual pick of three.
+static void OnBossCleared(PlayState* play) {
+    EnterRoomState(ROOM_STATE_CLEARED);
+    SaveBestFloor(sRun.floor);
+    sRun.chestFlag = CHEST_NONE;
+
+    Notify("Boss defeated! ", "Floor " + std::to_string(sRun.floor) + " cleared.");
+    GiveRoomClearRefill(play);
+    if (gSaveContext.healthCapacity < 20 * 16) {
+        Item_Give(play, ITEM_HEART_CONTAINER);
+        Notify("Reward: ", "Heart Container", GetTextureForItemId(ITEM_HEART_CONTAINER));
+    }
+    gSaveContext.healthAccumulator = gSaveContext.healthCapacity; // full heal
+
+    // A bonus that chests can't hold.
+    std::vector<RoguelikeReward> bonus;
+    for (RoguelikeReward reward : { REWARD_MAGIC, REWARD_DOUBLE_MAGIC, REWARD_DOUBLE_DEFENSE }) {
+        if (IsRewardAvailable(reward)) {
+            bonus.push_back(reward);
+        }
+    }
+    if (!bonus.empty()) {
+        GiveReward(play, bonus[RandInt(0, (int)bonus.size() - 1)]);
+    }
+
+    GainXp(play, 60 + 15 * sRun.floor);
+
+    if (SpawnRewardChoice(play)) {
+        Notify("Choose your reward! ", "Open one chest - the others will vanish.");
+    } else {
+        GiveRandomReward(play);
     }
 }
 
@@ -1440,13 +1878,29 @@ static void OnPlayerUpdateRoguelike() {
                 break;
             }
             int limit = ROGUELIKE_ROOM_TIME_LIMIT;
+            if (sRun.modifier == FLOORMOD_HASTY) {
+                limit = 45;
+            }
             if (limit > 0 && sRun.roomFrames >= limit * FRAMES_PER_SECOND) {
                 OnRoomCleared(play, true);
             }
             break;
         }
 
+        case ROOM_STATE_BOSS:
+            if (sRun.bossDefeated) {
+                sRun.bossWaitFrames++;
+                if (sRun.bossWaitFrames >= 2 * FRAMES_PER_SECOND && play->msgCtx.msgMode == MSGMODE_NONE &&
+                    !Player_InCsMode(play)) {
+                    OnBossCleared(play);
+                }
+            }
+            break;
+
         case ROOM_STATE_CLEARED:
+            if (UpdateRewardChoice(play)) {
+                break;
+            }
             if (sRun.chestFlag != CHEST_NONE) {
                 if (Flags_GetTreasure(play, sRun.chestFlag)) {
                     // Opened. Free the flag again so it can't hide a real chest later, then wait for the item
@@ -1480,6 +1934,7 @@ static void OnPlayerUpdateRoguelike() {
 }
 
 static void OnSceneInitRoguelike(int16_t sceneNum) {
+    SetRunMirror(sRun.active && sRun.modifier == FLOORMOD_MIRROR);
     if (!sRun.active) {
         return;
     }
@@ -1489,8 +1944,14 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sEnemies.clear();
     sNewElites.clear();
     sPendingAffix = AFFIX_NONE;
+    sChoiceCount = 0;
     if (sRun.roomState != ROOM_STATE_RUN_OVER) {
-        EnterRoomState(ROOM_STATE_ENTERING);
+        if (sRun.bossFloor) {
+            sRun.wavesLeft = 0;
+            EnterRoomState(ROOM_STATE_BOSS);
+        } else {
+            EnterRoomState(ROOM_STATE_ENTERING);
+        }
     }
 }
 
@@ -1520,6 +1981,7 @@ static void OnLoadGameRoguelike(int32_t fileNum) {
     sPendingRoomPick = false;
     sStartRequested = false;
     sAbandonRequested = false;
+    SetRunMirror(false);
 
     if (IS_ROGUELIKE) {
         StartRunFromFileLoad();
@@ -1555,6 +2017,11 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     gDPSetCombineLERP(POLY_OPA_DISP++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, PRIMITIVE, TEXEL0, 0,
                       PRIMITIVE, 0);
     CLOSE_DISPS(play->state.gfxCtx);
+
+    if (sRun.bossFloor || sRun.modifier != FLOORMOD_NONE) {
+        std::string twist = sRun.bossFloor ? std::string("Boss floor") : std::string(sModifierNames[sRun.modifier]);
+        Interface_DrawTextLine(play->state.gfxCtx, (char*)twist.c_str(), 190, 210, 150, 210, 255, alpha, 0.65f, 1);
+    }
 
     // Left: level (gold). Right: floor (white).
     Interface_DrawTextLine(play->state.gfxCtx, (char*)levelText.c_str(), 40, 222, 255, 220, 100, alpha, 0.75f, 1);
@@ -1607,6 +2074,24 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(OnActorUpdate, true, OnActorUpdateRoguelike);
     COND_HOOK(OnActorDestroy, true, OnActorDestroyRoguelike);
     COND_HOOK(OnEnemyDefeat, true, OnEnemyDefeatRoguelike);
+    COND_HOOK(OnBossDefeat, true, OnBossDefeatRoguelike);
+
+    // Boss floors: no blue warp out and no heart container drop; the run hands out its own rewards.
+    COND_VB_SHOULD(VB_SPAWN_BLUE_WARP, true, {
+        if (sRun.active) {
+            *should = false;
+        }
+    });
+    COND_VB_SHOULD(VB_PLAY_BLUE_WARP_CS, true, {
+        if (sRun.active) {
+            *should = false;
+        }
+    });
+    COND_VB_SHOULD(VB_SPAWN_HEART_CONTAINER, true, {
+        if (sRun.active) {
+            *should = false;
+        }
+    });
 
     // No saving during a run: the real save file stays untouched.
     COND_VB_SHOULD(VB_BE_ABLE_TO_SAVE, true, {

@@ -1934,7 +1934,8 @@ void SohMenu::AddMenuEnhancements() {
     AddWidget(path, "Item Reward Every %d Floors", WIDGET_CVAR_SLIDER_INT)
         .CVar(CVAR_ENHANCEMENT("Roguelike.RewardEvery"))
         .Options(IntSliderOptions().Min(1).Max(5).DefaultValue(2).Format("%d").Tooltip(
-            "How often clearing a floor gives a random item (bow, hookshot, magic, heart containers...)."));
+            "How often clearing a floor gives a reward. Usually a choice of three chests: open one and the "
+            "others vanish."));
     AddWidget(path, "Treasure Chest Chance: %d%%", WIDGET_CVAR_SLIDER_INT)
         .CVar(CVAR_ENHANCEMENT("Roguelike.ChestChance"))
         .Options(IntSliderOptions().Min(0).Max(100).DefaultValue(35).Format("%d%%").Tooltip(
@@ -1946,6 +1947,23 @@ void SohMenu::AddMenuEnhancements() {
             "Some enemies become elites with an element: Fire sets you on fire, Ice freezes you, Poison drains your "
             "hearts and Shock electrocutes you. Elites sparkle in their element's colour, are tougher, and give "
             "double XP. More elites appear on deeper floors."));
+    AddWidget(path, "Boss Floors", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.BossFloors"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Every few floors is a boss fight. Only bosses you can beat with your current gear are picked "
+            "(Volvagia always; others need the bow, bombs, hookshot or Mirror Shield). Beating one gives a heart "
+            "container, a full heal, a bonus upgrade and a choice of three items."));
+    AddWidget(path, "Boss Every %d Floors", WIDGET_CVAR_SLIDER_INT)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.BossEvery"))
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = CVarGetInteger(CVAR_ENHANCEMENT("Roguelike.BossFloors"), 1) == 0;
+        })
+        .Options(IntSliderOptions().Min(2).Max(10).DefaultValue(5).Format("%d"));
+    AddWidget(path, "Floor Modifiers", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Modifiers"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Floors can roll a twist (more often deeper down): Mirror World, Giants, Glass Cannon, Swarm, "
+            "Elite Floor or Hasty. The twist is announced when you land and shown on the pause screen."));
     AddWidget(path, "Restart Run Automatically on Death", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.AutoRestart"))
         .Options(
