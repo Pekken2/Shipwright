@@ -605,13 +605,13 @@ typedef struct {
 } RoguelikeMask;
 
 static const RoguelikeMask sMasks[] = {
-    { ITEM_MASK_KEATON, GI_MASK_KEATON, PLAYER_MASK_KEATON, "Keaton Mask", "Swift: run 30 percent faster." },
+    { ITEM_MASK_KEATON, GI_MASK_KEATON, PLAYER_MASK_KEATON, "Keaton Mask",
+      "Lucky: 50 percent more XP, and a heart back after each room." },
     { ITEM_MASK_SKULL, GI_MASK_SKULL, PLAYER_MASK_SKULL, "Skull Mask",
       "Berserker: deal 50 percent more damage, take 25 percent more." },
     { ITEM_MASK_SPOOKY, GI_MASK_SPOOKY, PLAYER_MASK_SPOOKY, "Spooky Mask",
       "Haunting: a quarter of enemy hits pass right through you." },
-    { ITEM_MASK_BUNNY, GI_MASK_BUNNY, PLAYER_MASK_BUNNY, "Bunny Hood",
-      "Lucky: 50 percent more XP, and a heart back after each room." },
+    { ITEM_MASK_BUNNY, GI_MASK_BUNNY, PLAYER_MASK_BUNNY, "Bunny Hood", "Swift: run 30 percent faster." },
     { ITEM_MASK_GORON, GI_MASK_GORON, PLAYER_MASK_GORON, "Goron Mask",
       "Fireproof: Fire elites can't burn you, and you take 20 percent less damage." },
     { ITEM_MASK_ZORA, GI_MASK_ZORA, PLAYER_MASK_ZORA, "Zora Mask", "Tidal: immune to Ice, Shock and Poison elites." },
@@ -1934,7 +1934,7 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
         xp = xp * 3 / 2;
     }
     xp = xp * (2 + RelicCount(RELIC_SCHOLARS_LENS)) / 2; // Scholar's Lens: +50 percent per stack
-    if (Wearing(PLAYER_MASK_BUNNY)) {
+    if (Wearing(PLAYER_MASK_KEATON)) {
         xp = xp * 3 / 2;
     }
     if (Wearing(PLAYER_MASK_TRUTH) && elite) {
@@ -2542,8 +2542,8 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
 
     Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
     GiveRoomClearRefill(play);
-    if (Wearing(PLAYER_MASK_BUNNY)) {
-        ApplyOwnHealthChange(play, 16); // Bunny Hood: a heart back
+    if (Wearing(PLAYER_MASK_KEATON)) {
+        ApplyOwnHealthChange(play, 16); // Keaton Mask: a heart back
     }
 
     int every = std::max(1, ROGUELIKE_REWARD_EVERY);
@@ -2984,12 +2984,12 @@ static void RegisterRoguelikeDescent() {
 
     // Pegasus Feather: a faster ground run speed. Steps aside if another speed effect already took over this frame.
     COND_VB_SHOULD(VB_PLAYER_MODIFY_RUN_SPEED, true, {
-        if (sRun.active && (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_KEATON)) && *should) {
+        if (sRun.active && (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_BUNNY)) && *should) {
             Player* player = va_arg(args, Player*);
             f32* speedTarget = va_arg(args, f32*);
             s16* yawTarget = va_arg(args, s16*);
             *speedTarget *=
-                1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_KEATON) ? 0.3f : 0.0f);
+                1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_BUNNY) ? 0.3f : 0.0f);
             func_8083DF68(player, *speedTarget, *yawTarget);
             func_8083DDC8(player, gPlayState);
             *should = false;
