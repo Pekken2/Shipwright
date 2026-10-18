@@ -170,6 +170,8 @@ typedef enum {
     REWARD_HOVER_BOOTS,
     REWARD_DOUBLE_DEFENSE,
     REWARD_FAIRY_BOTTLE,
+    REWARD_MASTER_SWORD,
+    REWARD_HYLIAN_SHIELD,
     REWARD_MAX,
 } RoguelikeReward;
 
@@ -507,6 +509,12 @@ static bool IsRewardAvailable(RoguelikeReward reward) {
             return !gSaveContext.isDoubleDefenseAcquired;
         case REWARD_FAIRY_BOTTLE:
             return gSaveContext.inventory.items[SLOT_BOTTLE_4] == ITEM_NONE;
+        case REWARD_MASTER_SWORD:
+            return !CHECK_OWNED_EQUIP(EQUIP_TYPE_SWORD, EQUIP_INV_SWORD_MASTER);
+        case REWARD_HYLIAN_SHIELD:
+            // Also offered again if the Deku Shield burned up and there's no better shield.
+            return !CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_HYLIAN) &&
+                   !CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_MIRROR);
         default:
             return false;
     }
@@ -629,6 +637,25 @@ static void GiveReward(PlayState* play, RoguelikeReward reward) {
             name = "Bottled Fairy (saves you from one death)";
             icon = ITEM_FAIRY;
             break;
+        case REWARD_MASTER_SWORD:
+            Item_Give(play, ITEM_SWORD_MASTER);
+            // Upgrade from the Kokiri Sword, but don't take Biggoron's Sword out of Link's hands.
+            if (gSaveContext.equips.buttonItems[0] != ITEM_SWORD_BGS) {
+                gSaveContext.equips.buttonItems[0] = ITEM_SWORD_MASTER;
+                SetEquipValue(EQUIP_TYPE_SWORD, EQUIP_VALUE_SWORD_MASTER);
+                Interface_LoadItemIcon1(play, 0);
+                Player_SetEquipmentData(play, player);
+            }
+            name = "Master Sword";
+            icon = ITEM_SWORD_MASTER;
+            break;
+        case REWARD_HYLIAN_SHIELD:
+            Item_Give(play, ITEM_SHIELD_HYLIAN);
+            SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_HYLIAN);
+            Player_SetEquipmentData(play, player);
+            name = "Hylian Shield (won't burn)";
+            icon = ITEM_SHIELD_HYLIAN;
+            break;
         default:
             return;
     }
@@ -677,6 +704,8 @@ static GetItemID RewardToGetItem(RoguelikeReward reward) {
     switch (reward) {
         case REWARD_HEART_CONTAINER:
             return GI_HEART_CONTAINER_2;
+        case REWARD_HYLIAN_SHIELD:
+            return GI_SHIELD_HYLIAN;
         case REWARD_BOW:
             return GI_BOW;
         case REWARD_HOOKSHOT:
@@ -845,6 +874,12 @@ static void OnItemReceiveRoguelike(GetItemEntry itemEntry) {
         case ITEM_SHIELD_MIRROR:
             SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_MIRROR);
             Player_SetEquipmentData(play, player);
+            break;
+        case ITEM_SHIELD_HYLIAN:
+            if (CUR_EQUIP_VALUE(EQUIP_TYPE_SHIELD) != EQUIP_VALUE_SHIELD_MIRROR) {
+                SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_HYLIAN);
+                Player_SetEquipmentData(play, player);
+            }
             break;
         case ITEM_SWORD_BGS:
             gSaveContext.bgsFlag = true;
@@ -1835,8 +1870,9 @@ static void ApplyStartingLoadout() {
     gSaveContext.inventory.equipment = 0;
     gSaveContext.inventory.defenseHearts = 0;
 
-    GiveOwnedEquip(EQUIP_TYPE_SWORD, EQUIP_INV_SWORD_MASTER);
-    GiveOwnedEquip(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_HYLIAN);
+    // A humble start: the Kokiri Sword and Deku Shield, usable as adult during runs (see the age rule hooks).
+    GiveOwnedEquip(EQUIP_TYPE_SWORD, EQUIP_INV_SWORD_KOKIRI);
+    GiveOwnedEquip(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_DEKU);
     GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_KOKIRI);
     GiveOwnedEquip(EQUIP_TYPE_BOOTS, EQUIP_INV_BOOTS_KOKIRI);
 
@@ -1846,10 +1882,10 @@ static void ApplyStartingLoadout() {
     for (s32 i = 0; i < ARRAY_COUNT(gSaveContext.equips.cButtonSlots); i++) {
         gSaveContext.equips.cButtonSlots[i] = SLOT_NONE;
     }
-    gSaveContext.equips.buttonItems[0] = ITEM_SWORD_MASTER;
+    gSaveContext.equips.buttonItems[0] = ITEM_SWORD_KOKIRI;
     gSaveContext.equips.equipment = 0;
-    SetEquipValue(EQUIP_TYPE_SWORD, EQUIP_VALUE_SWORD_MASTER);
-    SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_HYLIAN);
+    SetEquipValue(EQUIP_TYPE_SWORD, EQUIP_VALUE_SWORD_KOKIRI);
+    SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_DEKU);
     SetEquipValue(EQUIP_TYPE_TUNIC, EQUIP_VALUE_TUNIC_KOKIRI);
     SetEquipValue(EQUIP_TYPE_BOOTS, EQUIP_VALUE_BOOTS_KOKIRI);
     gSaveContext.adultEquips = gSaveContext.equips;
@@ -2054,7 +2090,7 @@ static void OnBossCleared(PlayState* play) {
 
     // A bonus that chests can't hold.
     std::vector<RoguelikeReward> bonus;
-    for (RoguelikeReward reward : { REWARD_MAGIC, REWARD_DOUBLE_MAGIC, REWARD_DOUBLE_DEFENSE }) {
+    for (RoguelikeReward reward : { REWARD_MASTER_SWORD, REWARD_MAGIC, REWARD_DOUBLE_MAGIC, REWARD_DOUBLE_DEFENSE }) {
         if (IsRewardAvailable(reward)) {
             bonus.push_back(reward);
         }
@@ -2393,6 +2429,22 @@ static void RegisterRoguelikeDescent() {
     COND_VB_SHOULD(VB_BE_ABLE_TO_SAVE, true, {
         if (sRun.active) {
             *should = false;
+        }
+    });
+    // Adult Link can use child equipment (Kokiri Sword, Deku Shield) during runs - same rules as Timeless Equipment.
+    COND_VB_SHOULD(VB_PLAYER_MEETS_AGE_REQ, true, {
+        if (sRun.active) {
+            *should = true;
+        }
+    });
+    COND_VB_SHOULD(VB_ITEM_MEETS_AGE_REQ, true, {
+        if (sRun.active) {
+            *should = true;
+        }
+    });
+    COND_VB_SHOULD(VB_SLOT_MEETS_AGE_REQ, true, {
+        if (sRun.active) {
+            *should = true;
         }
     });
     // Doors are sealed: each room is an arena.
