@@ -18,4 +18,7 @@ void Roguelike_RequestStartRun();
 void Roguelike_RequestAbandonRun();
 int Roguelike_GetCurrentFloor();
 int Roguelike_GetBestFloor();
+int Roguelike_GetLevel();
+int Roguelike_GetXp();
+int Roguelike_GetXpForNextLevel();
 #endif

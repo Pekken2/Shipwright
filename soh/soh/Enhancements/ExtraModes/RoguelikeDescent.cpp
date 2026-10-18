@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,7 @@ extern PlayState* gPlayState;
 #define ROGUELIKE_REWARD_EVERY CVarGetInteger(CVAR_ROGUELIKE("RewardEvery"), 2)
 #define ROGUELIKE_AUTO_RESTART CVarGetInteger(CVAR_ROGUELIKE("AutoRestart"), 0)
 #define ROGUELIKE_CHEST_CHANCE CVarGetInteger(CVAR_ROGUELIKE("ChestChance"), 35)
+#define ROGUELIKE_ELITES CVarGetInteger(CVAR_ROGUELIKE("Elites"), 1)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -192,6 +194,8 @@ static struct {
     int stateFrames;
     int wavesLeft;
     s32 chestFlag; // treasure flag of the reward chest waiting to be opened, or CHEST_NONE
+    int level;     // Link's level this run
+    int xp;        // XP towards the next level
 } sRun;
 
 static SaveContext sSnapshot;
@@ -854,6 +858,294 @@ static void SpawnWave(PlayState* play) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Leveling: Link levels up from kills; enemies get levels from the floor depth, and some are elites with an element.
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef enum {
+    AFFIX_NONE,
+    AFFIX_FIRE,   // sets Link on fire
+    AFFIX_ICE,    // freezes Link
+    AFFIX_POISON, // drains hearts over a few seconds
+    AFFIX_SHOCK,  // electrocutes Link
+    AFFIX_MAX,
+} EnemyAffix;
+
+static const char* sAffixNames[AFFIX_MAX] = { "", "Fire", "Ice", "Poison", "Shock" };
+static const Color_RGBA8 sAffixPrim[AFFIX_MAX] = {
+    { 0, 0, 0, 0 }, { 255, 220, 120, 255 }, { 220, 255, 255, 255 }, { 210, 255, 140, 255 }, { 255, 255, 200, 255 },
+};
+static const Color_RGBA8 sAffixEnv[AFFIX_MAX] = {
+    { 0, 0, 0, 0 }, { 255, 60, 0, 255 }, { 60, 150, 255, 255 }, { 60, 200, 30, 255 }, { 255, 230, 0, 255 },
+};
+
+typedef struct {
+    int level;
+    EnemyAffix affix;
+    u8 prevHealth;
+} EnemyInfo;
+
+static std::unordered_map<Actor*, EnemyInfo> sEnemies;
+static std::vector<EnemyAffix> sNewElites; // elites that appeared this frame, announced together
+
+static EnemyAffix sPendingAffix = AFFIX_NONE; // element to apply to Link once the hit that caused it settles
+static int sPendingAffixDelay = 0;
+static int sAffixCooldown = 0;
+static int sPoisonTicks = 0;
+static int sPoisonTimer = 0;
+static bool sApplyingOwnDamage = false; // set while we change health ourselves, so it isn't scaled again
+
+static constexpr int AFFIX_COOLDOWN = 3 * FRAMES_PER_SECOND;
+static constexpr int POISON_TICKS = 5;
+static constexpr int POISON_INTERVAL = FRAMES_PER_SECOND * 3 / 2;
+static constexpr int MAX_LEVEL = 30;
+
+static int XpForNextLevel(int level) {
+    return 40 * level;
+}
+// Extra damage Link deals, in percent.
+static int PlayerDamageBonusPct(int level) {
+    return 8 * (level - 1);
+}
+// Damage Link shrugs off, in percent.
+static int PlayerDefensePct(int level) {
+    return std::min(3 * (level - 1), 40);
+}
+// How much harder enemies hit on deeper floors.
+static f32 EnemyDamageMultiplier(int floor) {
+    return std::min(1.0f + 0.06f * (floor - 1), 2.5f);
+}
+
+static void ResetLeveling() {
+    sRun.level = 1;
+    sRun.xp = 0;
+    sEnemies.clear();
+    sNewElites.clear();
+    sPendingAffix = AFFIX_NONE;
+    sPendingAffixDelay = 0;
+    sAffixCooldown = 0;
+    sPoisonTicks = 0;
+    sPoisonTimer = 0;
+}
+
+static void ApplyOwnHealthChange(PlayState* play, s16 amount) {
+    sApplyingOwnDamage = true;
+    Health_ChangeBy(play, amount);
+    sApplyingOwnDamage = false;
+}
+
+static void GainXp(PlayState* play, int xp) {
+    if (sRun.level >= MAX_LEVEL) {
+        return;
+    }
+    sRun.xp += xp;
+    while (sRun.level < MAX_LEVEL && sRun.xp >= XpForNextLevel(sRun.level)) {
+        sRun.xp -= XpForNextLevel(sRun.level);
+        sRun.level++;
+
+        std::string perks = "+" + std::to_string(PlayerDamageBonusPct(sRun.level)) + "% damage, " +
+                            std::to_string(PlayerDefensePct(sRun.level)) + "% defense";
+        if (sRun.level % 3 == 0 && gSaveContext.healthCapacity < 20 * 16) {
+            gSaveContext.healthCapacity += 16;
+            perks += ", +1 heart";
+        }
+        ApplyOwnHealthChange(play, 2 * 16);
+        Audio_PlayFanfare(NA_BGM_SMALL_ITEM_GET);
+        Notify("Level up! Level " + std::to_string(sRun.level) + ": ", perks);
+    }
+}
+
+// Gives a newly seen enemy its level (more health) and maybe makes it an elite.
+static void SetUpEnemy(Actor* actor) {
+    EnemyInfo info;
+    info.level = std::max(1, sRun.floor + RandInt(-1, 1));
+    info.affix = AFFIX_NONE;
+
+    int eliteChance = std::min(8 + sRun.floor * 4, 60);
+    if (ROGUELIKE_ELITES && RandInt(1, 100) <= eliteChance) {
+        info.affix = (EnemyAffix)RandInt(AFFIX_FIRE, AFFIX_MAX - 1);
+        info.level += 2;
+        sNewElites.push_back(info.affix);
+    }
+
+    f32 healthScale = 1.0f + 0.10f * (info.level - 1);
+    if (info.affix != AFFIX_NONE) {
+        healthScale *= 1.5f;
+    }
+    int health = (int)lroundf(actor->colChkInfo.health * healthScale);
+    actor->colChkInfo.health = (u8)std::clamp(health, 1, 255);
+    info.prevHealth = actor->colChkInfo.health;
+
+    sEnemies[actor] = info;
+}
+
+static void DrawAffixParticles(PlayState* play, Actor* actor, EnemyAffix affix) {
+    if ((play->gameplayFrames % 4) != 0) {
+        return;
+    }
+    Vec3f pos = actor->focus.pos;
+    pos.x += RandFloat(-20.0f, 20.0f);
+    pos.y += RandFloat(-10.0f, 20.0f);
+    pos.z += RandFloat(-20.0f, 20.0f);
+    Vec3f velocity = { 0.0f, (affix == AFFIX_ICE) ? -0.5f : 1.5f, 0.0f };
+    Vec3f accel = { 0.0f, 0.0f, 0.0f };
+    Color_RGBA8 prim = sAffixPrim[affix];
+    Color_RGBA8 env = sAffixEnv[affix];
+    EffectSsKiraKira_SpawnDispersed(play, &pos, &velocity, &accel, &prim, &env, 1500, 12);
+}
+
+static void OnActorUpdateRoguelike(void* refActor) {
+    PlayState* play = gPlayState;
+    Actor* actor = (Actor*)refActor;
+    if (!sRun.active || play == NULL || actor->category != ACTORCAT_ENEMY) {
+        return;
+    }
+
+    auto it = sEnemies.find(actor);
+    if (it == sEnemies.end()) {
+        if (actor->colChkInfo.health == 0) {
+            return; // invulnerable or not set up yet
+        }
+        SetUpEnemy(actor);
+        return;
+    }
+    EnemyInfo& info = it->second;
+
+    // Link's level bonus: when this enemy loses health, take a bit more. Never finishes it off by itself, so the
+    // enemy's own death handling always runs from a real hit.
+    u8 health = actor->colChkInfo.health;
+    if (health < info.prevHealth && health > 0) {
+        int dealt = info.prevHealth - health;
+        int extra = (dealt * PlayerDamageBonusPct(sRun.level) + 50) / 100;
+        if (extra > 0) {
+            actor->colChkInfo.health = (u8)std::max(1, (int)health - extra);
+        }
+    }
+    info.prevHealth = actor->colChkInfo.health;
+
+    if (info.affix != AFFIX_NONE) {
+        DrawAffixParticles(play, actor, info.affix);
+    }
+}
+
+static void OnActorDestroyRoguelike(void* refActor) {
+    sEnemies.erase((Actor*)refActor);
+}
+
+static void OnEnemyDefeatRoguelike(void* refActor) {
+    PlayState* play = gPlayState;
+    if (!sRun.active || play == NULL) {
+        return;
+    }
+    // Some enemies report their defeat more than once; only the first counts, since the entry is erased here.
+    auto it = sEnemies.find((Actor*)refActor);
+    if (it == sEnemies.end()) {
+        return;
+    }
+    int level = it->second.level;
+    bool elite = it->second.affix != AFFIX_NONE;
+    sEnemies.erase(it);
+
+    int xp = 10 + 5 * level;
+    if (elite) {
+        xp *= 2;
+    }
+    GainXp(play, xp);
+}
+
+// The elite closest to Link, if one is close enough to have been the one that hit him.
+static EnemyAffix FindAttackingAffix(PlayState* play) {
+    Player* player = GET_PLAYER(play);
+    EnemyAffix best = AFFIX_NONE;
+    f32 bestDist = 200.0f;
+    for (const auto& [actor, info] : sEnemies) {
+        if (info.affix == AFFIX_NONE || actor->update == NULL) {
+            continue;
+        }
+        f32 dist = Actor_WorldDistXYZToActor(actor, &player->actor);
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = info.affix;
+        }
+    }
+    return best;
+}
+
+// Called for every health change while a run is active. Scales damage by floor depth and Link's defense, and
+// queues the element of an elite that just hit Link.
+static void ScaleDamageTaken(PlayState* play, int16_t amount) {
+    if (amount >= 0 || sApplyingOwnDamage) {
+        return;
+    }
+    int taken = -amount;
+    f32 scaled = taken * EnemyDamageMultiplier(sRun.floor) * (1.0f - PlayerDefensePct(sRun.level) / 100.0f);
+    int finalDamage = std::max(1, (int)lroundf(scaled));
+    int delta = finalDamage - taken; // positive: extra damage, negative: damage refunded
+    gSaveContext.health = (s16)std::clamp(gSaveContext.health - delta, -1, (int)gSaveContext.healthCapacity);
+
+    if (sAffixCooldown == 0 && sPendingAffix == AFFIX_NONE) {
+        EnemyAffix affix = FindAttackingAffix(play);
+        if (affix != AFFIX_NONE) {
+            sPendingAffix = affix;
+            sPendingAffixDelay = 8; // let the hit's own knockback play out first
+        }
+    }
+}
+
+static void UpdateLeveling(PlayState* play) {
+    if (!sNewElites.empty()) {
+        std::string names;
+        for (size_t i = 0; i < sNewElites.size(); i++) {
+            names += (i > 0 ? ", " : "") + std::string(sAffixNames[sNewElites[i]]);
+        }
+        Notify(sNewElites.size() == 1 ? "Elite enemy: " : "Elite enemies: ", names);
+        sNewElites.clear();
+    }
+
+    if (sAffixCooldown > 0) {
+        sAffixCooldown--;
+    }
+
+    Player* player = GET_PLAYER(play);
+    if (sPendingAffix != AFFIX_NONE && --sPendingAffixDelay <= 0 && gSaveContext.health > 0 &&
+        sRun.roomState != ROOM_STATE_RUN_OVER) {
+        switch (sPendingAffix) {
+            case AFFIX_FIRE:
+                GameInteractor::RawAction::BurnPlayer();
+                break;
+            case AFFIX_ICE:
+                GameInteractor::RawAction::FreezePlayer();
+                break;
+            case AFFIX_SHOCK:
+                GameInteractor::RawAction::ElectrocutePlayer();
+                break;
+            case AFFIX_POISON:
+                sPoisonTicks = POISON_TICKS;
+                sPoisonTimer = POISON_INTERVAL;
+                Notify("Poisoned!");
+                break;
+            default:
+                break;
+        }
+        sPendingAffix = AFFIX_NONE;
+        sAffixCooldown = AFFIX_COOLDOWN;
+    }
+
+    if (sPoisonTicks > 0 && --sPoisonTimer <= 0) {
+        sPoisonTicks--;
+        sPoisonTimer = POISON_INTERVAL;
+        Vec3f pos = player->actor.world.pos;
+        pos.y += 40.0f;
+        Vec3f velocity = { 0.0f, 1.0f, 0.0f };
+        Vec3f accel = { 0.0f, 0.0f, 0.0f };
+        Color_RGBA8 prim = sAffixPrim[AFFIX_POISON];
+        Color_RGBA8 env = sAffixEnv[AFFIX_POISON];
+        EffectSsKiraKira_SpawnDispersed(play, &pos, &velocity, &accel, &prim, &env, 2500, 15);
+        Player_PlaySfx(&player->actor, NA_SE_VO_LI_DAMAGE_S);
+        ApplyOwnHealthChange(play, -4); // a quarter heart per tick
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Run flow
 // ---------------------------------------------------------------------------------------------------------------------
 
@@ -952,6 +1244,7 @@ static void ResetRunState() {
     sRun.stateFrames = 0;
     sRun.wavesLeft = 0;
     sRun.chestFlag = CHEST_NONE;
+    ResetLeveling();
 }
 
 static void StartRun(PlayState* play) {
@@ -1121,6 +1414,7 @@ static void OnPlayerUpdateRoguelike() {
 
     sRun.roomFrames++;
     sRun.stateFrames++;
+    UpdateLeveling(play);
 
     switch (sRun.roomState) {
         case ROOM_STATE_ENTERING:
@@ -1192,13 +1486,22 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     // New room (or a reload of the same one after falling into a pit). Either way, the fight starts over.
     sRun.roomFrames = 0;
     sRun.wavesLeft = WavesForFloor(sRun.floor);
+    sEnemies.clear();
+    sNewElites.clear();
+    sPendingAffix = AFFIX_NONE;
     if (sRun.roomState != ROOM_STATE_RUN_OVER) {
         EnterRoomState(ROOM_STATE_ENTERING);
     }
 }
 
 static void OnPlayerHealthChangeRoguelike(int16_t amount) {
-    if (!sRun.active || sRun.roomState == ROOM_STATE_RUN_OVER || gSaveContext.health > 0) {
+    if (!sRun.active || sRun.roomState == ROOM_STATE_RUN_OVER) {
+        return;
+    }
+    if (gPlayState != NULL) {
+        ScaleDamageTaken(gPlayState, amount);
+    }
+    if (gSaveContext.health > 0) {
         return;
     }
     // A bottled fairy gets to do its job.
@@ -1251,6 +1554,18 @@ int Roguelike_GetBestFloor() {
     return CVarGetInteger(ROGUELIKE_BEST_FLOOR_CVAR, 0);
 }
 
+int Roguelike_GetLevel() {
+    return sRun.active ? sRun.level : 0;
+}
+
+int Roguelike_GetXp() {
+    return sRun.xp;
+}
+
+int Roguelike_GetXpForNextLevel() {
+    return XpForNextLevel(std::max(1, sRun.level));
+}
+
 static void RegisterRoguelikeDescent() {
     COND_HOOK(OnPlayerUpdate, true, OnPlayerUpdateRoguelike);
     COND_HOOK(OnSceneInit, true, OnSceneInitRoguelike);
@@ -1258,6 +1573,9 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(OnPlayerHealthChange, true, OnPlayerHealthChangeRoguelike);
     COND_HOOK(OnLoadGame, true, OnLoadGameRoguelike);
     COND_HOOK(OnItemReceive, true, OnItemReceiveRoguelike);
+    COND_HOOK(OnActorUpdate, true, OnActorUpdateRoguelike);
+    COND_HOOK(OnActorDestroy, true, OnActorDestroyRoguelike);
+    COND_HOOK(OnEnemyDefeat, true, OnEnemyDefeatRoguelike);
 
     // No saving during a run: the real save file stays untouched.
     COND_VB_SHOULD(VB_BE_ABLE_TO_SAVE, true, {

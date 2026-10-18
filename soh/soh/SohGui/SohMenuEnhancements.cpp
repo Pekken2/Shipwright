@@ -1909,8 +1909,10 @@ void SohMenu::AddMenuEnhancements() {
                                          "Descent file, this starts a fresh run instead."));
     AddWidget(path, "Roguelike Status", WIDGET_TEXT).PreFunc([](WidgetInfo& info) {
         if (Roguelike_IsRunActive()) {
-            info.name = "Floor " + std::to_string(Roguelike_GetCurrentFloor()) +
-                        "   (best: " + std::to_string(Roguelike_GetBestFloor()) + ")";
+            info.name = "Floor " + std::to_string(Roguelike_GetCurrentFloor()) + "   (best: " +
+                        std::to_string(Roguelike_GetBestFloor()) + ")   Level " +
+                        std::to_string(Roguelike_GetLevel()) + "   XP " + std::to_string(Roguelike_GetXp()) + "/" +
+                        std::to_string(Roguelike_GetXpForNextLevel());
         } else {
             info.name = "Best floor reached: " + std::to_string(Roguelike_GetBestFloor());
         }
@@ -1938,6 +1940,12 @@ void SohMenu::AddMenuEnhancements() {
         .Options(IntSliderOptions().Min(0).Max(100).DefaultValue(35).Format("%d%%").Tooltip(
             "Chance that a treasure chest appears after clearing a room. Chests hold heart pieces, ammo, or "
             "sometimes a major item like the Hookshot or Megaton Hammer. The floor waits for you to open it."));
+    AddWidget(path, "Elite Enemies", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Elites"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Some enemies become elites with an element: Fire sets you on fire, Ice freezes you, Poison drains your "
+            "hearts and Shock electrocutes you. Elites sparkle in their element's colour, are tougher, and give "
+            "double XP. More elites appear on deeper floors."));
     AddWidget(path, "Restart Run Automatically on Death", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.AutoRestart"))
         .Options(
