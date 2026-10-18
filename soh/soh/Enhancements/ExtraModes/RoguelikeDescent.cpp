@@ -757,7 +757,7 @@ static bool TrySpawnRewardChest(PlayState* play) {
     s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos); // open side faces Link
 
     Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
-                               ENBOX_PARAMS(isMajor ? ENBOX_TYPE_BIG_DEFAULT : ENBOX_TYPE_SMALL, item, flag));
+                               (s16)ENBOX_PARAMS(isMajor ? ENBOX_TYPE_BIG_DEFAULT : ENBOX_TYPE_SMALL, item, flag));
     if (chest == NULL) {
         return false;
     }
@@ -785,7 +785,7 @@ static void OnItemReceiveRoguelike(GetItemEntry itemEntry) {
         case ITEM_ARROW_FIRE:
         case ITEM_ARROW_ICE:
         case ITEM_ARROW_LIGHT:
-            AssignToFreeCButton(play, itemEntry.itemId);
+            AssignToFreeCButton(play, (u8)itemEntry.itemId);
             break;
         case ITEM_BOMB_BAG_20:
             AssignToFreeCButton(play, ITEM_BOMB);
