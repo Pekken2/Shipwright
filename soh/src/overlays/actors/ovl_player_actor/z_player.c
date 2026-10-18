@@ -3184,7 +3184,7 @@ s32 Player_UpperAction_CarryActor(Player* this, PlayState* play) {
 }
 
 void func_808357E8(Player* this, Gfx** dLists) {
-    if (LINK_IS_ADULT && (CVarGetInteger(CVAR_ENHANCEMENT("EquipmentAlwaysVisible"), 0))) {
+    if (LINK_IS_ADULT && (Ship_EquipmentAlwaysVisible())) {
         this->leftHandDLists = &dLists[1];
     } else {
         this->leftHandDLists = &dLists[gSaveContext.linkAge];
@@ -12824,7 +12824,7 @@ s32 func_8084B3CC(PlayState* play, Player* this) {
         if (!func_8002DD6C(this) || Player_HoldsHookshot(this)) {
             s32 projectileItemToUse = ITEM_BOW;
             if (CVarGetInteger(CVAR_ENHANCEMENT("BowSlingshotAmmoFix"), 0) ||
-                CVarGetInteger(CVAR_ENHANCEMENT("EquipmentAlwaysVisible"), 0)) {
+                Ship_EquipmentAlwaysVisible()) {
                 projectileItemToUse = LINK_IS_ADULT ? ITEM_BOW : ITEM_SLINGSHOT;
             }
 

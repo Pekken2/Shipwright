@@ -2751,6 +2751,12 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     Interface_DrawTextLine(play->state.gfxCtx, (char*)floorText.c_str(), 190, 222, 255, 255, 255, alpha, 0.75f, 1);
 }
 
+// "Equipment Always Visible" draws child gear (Kokiri Sword, Deku Shield) properly on adult Link. Runs need that,
+// so it counts as on while a run is active, without touching the player's own setting.
+extern "C" int Ship_EquipmentAlwaysVisible(void) {
+    return CVarGetInteger(CVAR_ENHANCEMENT("EquipmentAlwaysVisible"), 0) || sRun.active;
+}
+
 extern "C" bool Roguelike_IsRunActive() {
     return sRun.active;
 }

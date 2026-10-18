@@ -201,7 +201,7 @@ static void BuildHandItemDL(PlayState* play, Gfx** dList, Gfx* hand, Gfx* item, 
 }
 
 static bool IsScalingAdultItemAsChild() {
-    return CVarGetInteger(CVAR_ENHANCEMENT("EquipmentAlwaysVisible"), 0) &&
+    return Ship_EquipmentAlwaysVisible() &&
            CVarGetInteger(CVAR_ENHANCEMENT("ScaleAdultEquipmentAsChild"), 0) && !LINK_IS_ADULT;
 }
 

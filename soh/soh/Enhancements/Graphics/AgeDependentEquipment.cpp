@@ -7,6 +7,7 @@
 extern "C" {
 #include "z64.h"
 #include "macros.h"
+#include "functions.h"
 #include "objects/object_link_boy/object_link_boy.h"
 #include "objects/object_link_child/object_link_child.h"
 extern SaveContext gSaveContext;
@@ -75,15 +76,22 @@ static void MakeEquipmentAlwaysVisible() {
     }
 }
 
-static void RegisterAgeDependentEquipmentHook() {
-    if (CVAR_AGE_EQUIPMENT_VALUE) {
+static void UpdateAgeDependentEquipment() {
+    // On with the setting, and also during Roguelike Descent runs (adult Link starts with the Kokiri Sword and
+    // Deku Shield there).
+    if (Ship_EquipmentAlwaysVisible()) {
         MakeEquipmentAlwaysVisible();
     } else {
         ResetAdultHands();
         ResetChildHands();
     }
+}
 
-    COND_HOOK(OnSceneInit, CVAR_AGE_EQUIPMENT_VALUE, [](int32_t) { MakeEquipmentAlwaysVisible(); });
+static void RegisterAgeDependentEquipmentHook() {
+    UpdateAgeDependentEquipment();
+
+    // Checked on every scene load, so runs starting and ending switch it on and off.
+    COND_HOOK(OnSceneInit, true, [](int32_t) { UpdateAgeDependentEquipment(); });
 }
 
 static RegisterShipInitFunc initFunc(RegisterAgeDependentEquipmentHook, { CVAR_AGE_EQUIPMENT_NAME });
