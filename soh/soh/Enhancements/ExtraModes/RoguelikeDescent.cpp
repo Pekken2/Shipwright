@@ -177,6 +177,7 @@ typedef enum {
     REWARD_FAIRY_BOTTLE,
     REWARD_MASTER_SWORD,
     REWARD_HYLIAN_SHIELD,
+    REWARD_MASK, // a random mask other than the one Link carries
     REWARD_MAX,
 } RoguelikeReward;
 
@@ -591,6 +592,92 @@ static void GiveMagic(PlayState* play, bool doubleMagic) {
     Magic_Fill(play);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Masks: one can be carried at a time (they share the child trade slot). Each gives an ability while it's worn.
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef struct {
+    u8 item;
+    GetItemID getItem;
+    PlayerMask mask;
+    const char* name;
+    const char* ability;
+} RoguelikeMask;
+
+static const RoguelikeMask sMasks[] = {
+    { ITEM_MASK_KEATON, GI_MASK_KEATON, PLAYER_MASK_KEATON, "Keaton Mask", "Swift: run 30 percent faster." },
+    { ITEM_MASK_SKULL, GI_MASK_SKULL, PLAYER_MASK_SKULL, "Skull Mask",
+      "Berserker: deal 50 percent more damage, take 25 percent more." },
+    { ITEM_MASK_SPOOKY, GI_MASK_SPOOKY, PLAYER_MASK_SPOOKY, "Spooky Mask",
+      "Haunting: a quarter of enemy hits pass right through you." },
+    { ITEM_MASK_BUNNY, GI_MASK_BUNNY, PLAYER_MASK_BUNNY, "Bunny Hood",
+      "Lucky: 50 percent more XP, and a heart back after each room." },
+    { ITEM_MASK_GORON, GI_MASK_GORON, PLAYER_MASK_GORON, "Goron Mask",
+      "Fireproof: Fire elites can't burn you, and you take 20 percent less damage." },
+    { ITEM_MASK_ZORA, GI_MASK_ZORA, PLAYER_MASK_ZORA, "Zora Mask", "Tidal: immune to Ice, Shock and Poison elites." },
+    { ITEM_MASK_GERUDO, GI_MASK_GERUDO, PLAYER_MASK_GERUDO, "Gerudo Mask",
+      "Treasure Hunter: more chests, and one more reward to choose from." },
+    { ITEM_MASK_TRUTH, GI_MASK_TRUTH, PLAYER_MASK_TRUTH, "Mask of Truth",
+      "Insight: deal 50 percent more damage to elites, and they give triple XP." },
+};
+
+static const RoguelikeMask* FindMaskByItem(u8 item) {
+    for (const RoguelikeMask& mask : sMasks) {
+        if (mask.item == item) {
+            return &mask;
+        }
+    }
+    return NULL;
+}
+
+// The mask Link has on right now (abilities only work while it's worn).
+static PlayerMask WornMask() {
+    if (!sRun.active || gPlayState == NULL) {
+        return PLAYER_MASK_NONE;
+    }
+    Player* player = GET_PLAYER(gPlayState);
+    return player != NULL ? (PlayerMask)player->currentMask : PLAYER_MASK_NONE;
+}
+
+static bool Wearing(PlayerMask mask) {
+    return WornMask() == mask;
+}
+
+// A random mask other than the one Link carries.
+static const RoguelikeMask* PickNewMask() {
+    std::vector<const RoguelikeMask*> pool;
+    u8 carried = INV_CONTENT(ITEM_TRADE_CHILD);
+    for (const RoguelikeMask& mask : sMasks) {
+        if (mask.item != carried) {
+            pool.push_back(&mask);
+        }
+    }
+    return pool[RandInt(0, (int)pool.size() - 1)];
+}
+
+// The new mask replaces the old one on its C button (or takes a free one), and Link puts it on right away.
+static void EquipNewMask(PlayState* play, const RoguelikeMask& mask) {
+    bool assigned = false;
+    for (s32 button = 1; button <= 3; button++) {
+        u8 onButton = gSaveContext.equips.buttonItems[button];
+        if (onButton >= ITEM_MASK_KEATON && onButton <= ITEM_MASK_TRUTH) {
+            gSaveContext.equips.buttonItems[button] = mask.item;
+            gSaveContext.equips.cButtonSlots[button - 1] = SLOT(mask.item);
+            Interface_LoadItemIcon1(play, button);
+            assigned = true;
+            break;
+        }
+    }
+    if (!assigned) {
+        AssignToFreeCButton(play, mask.item);
+    }
+
+    Player* player = GET_PLAYER(play);
+    player->currentMask = (u8)mask.mask;
+    gSaveContext.ship.maskMemory = (u8)mask.mask;
+    Notify(std::string(mask.name) + " - ", mask.ability);
+}
+
 static bool IsRewardAvailable(RoguelikeReward reward) {
     const bool hasMagic = gSaveContext.isMagicAcquired;
     const bool hasBow = HasItem(ITEM_BOW);
@@ -638,6 +725,8 @@ static bool IsRewardAvailable(RoguelikeReward reward) {
             // Also offered again if the Deku Shield burned up and there's no better shield.
             return !CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_HYLIAN) &&
                    !CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_MIRROR);
+        case REWARD_MASK:
+            return true;
         default:
             return false;
     }
@@ -779,6 +868,14 @@ static void GiveReward(PlayState* play, RoguelikeReward reward) {
             name = "Hylian Shield (won't burn)";
             icon = ITEM_SHIELD_HYLIAN;
             break;
+        case REWARD_MASK: {
+            const RoguelikeMask* mask = PickNewMask();
+            Item_Give(play, mask->item);
+            EquipNewMask(play, *mask);
+            name = mask->name;
+            icon = mask->item;
+            break;
+        }
         default:
             return;
     }
@@ -829,6 +926,8 @@ static GetItemID RewardToGetItem(RoguelikeReward reward) {
             return GI_HEART_CONTAINER_2;
         case REWARD_HYLIAN_SHIELD:
             return GI_SHIELD_HYLIAN;
+        case REWARD_MASK:
+            return PickNewMask()->getItem;
         case REWARD_BOW:
             return GI_BOW;
         case REWARD_HOOKSHOT:
@@ -924,7 +1023,8 @@ static s32 FindFreeTreasureFlag(PlayState* play);
 
 static bool TrySpawnRewardChest(PlayState* play) {
     // Randomizer files map chests to seed locations, so chests are kept out of runs started on them.
-    if (IS_RANDO || RandInt(1, 100) > ROGUELIKE_CHEST_CHANCE + 15 * RelicCount(RELIC_LUCKY_CLOVER)) {
+    if (IS_RANDO || RandInt(1, 100) > ROGUELIKE_CHEST_CHANCE + 15 * RelicCount(RELIC_LUCKY_CLOVER) +
+                                          (Wearing(PLAYER_MASK_GERUDO) ? 25 : 0)) {
         return false;
     }
 
@@ -998,6 +1098,20 @@ static void OnItemReceiveRoguelike(GetItemEntry itemEntry) {
             SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_MIRROR);
             Player_SetEquipmentData(play, player);
             break;
+        case ITEM_MASK_KEATON:
+        case ITEM_MASK_SKULL:
+        case ITEM_MASK_SPOOKY:
+        case ITEM_MASK_BUNNY:
+        case ITEM_MASK_GORON:
+        case ITEM_MASK_ZORA:
+        case ITEM_MASK_GERUDO:
+        case ITEM_MASK_TRUTH: {
+            const RoguelikeMask* mask = FindMaskByItem((u8)itemEntry.itemId);
+            if (mask != NULL) {
+                EquipNewMask(play, *mask);
+            }
+            break;
+        }
         case ITEM_SHIELD_HYLIAN:
             if (CUR_EQUIP_VALUE(EQUIP_TYPE_SHIELD) != EQUIP_VALUE_SHIELD_MIRROR) {
                 SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_HYLIAN);
@@ -1115,7 +1229,7 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
     std::vector<Offer> offers;
     std::vector<Relic> offeredRelics;
 
-    int slots = 3 + (HasRelic(RELIC_LUCKY_CLOVER) ? 1 : 0);
+    int slots = 3 + (HasRelic(RELIC_LUCKY_CLOVER) ? 1 : 0) + (Wearing(PLAYER_MASK_GERUDO) ? 1 : 0);
     for (int i = 0; i < slots; i++) {
         bool wantRelic = ROGUELIKE_RELICS && ((guaranteeRelic && i == 0) || RandInt(1, 100) <= 35 || items.empty());
         Relic relic = wantRelic ? PickRelic(false, offeredRelics) : RELIC_NONE;
@@ -1718,7 +1832,9 @@ static void OnActorUpdateRoguelike(void* refActor) {
     if (health < info.prevHealth && health > 0) {
         int dealt = info.prevHealth - health;
         int bonusPct = PlayerDamageBonusPct(sRun.level) + (sRun.modifier == FLOORMOD_GLASS_CANNON ? 100 : 0) +
-                       25 * RelicCount(RELIC_GORON_FIST) + (HasRelic(RELIC_GLASS_SWORD) ? 100 : 0);
+                       25 * RelicCount(RELIC_GORON_FIST) + (HasRelic(RELIC_GLASS_SWORD) ? 100 : 0) +
+                       (Wearing(PLAYER_MASK_SKULL) ? 50 : 0) +
+                       (Wearing(PLAYER_MASK_TRUTH) && info.affix != AFFIX_NONE ? 50 : 0);
         int extra = (dealt * bonusPct + 50) / 100;
         if (extra > 0) {
             actor->colChkInfo.health = (u8)std::max(1, (int)health - extra);
@@ -1818,6 +1934,12 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
         xp = xp * 3 / 2;
     }
     xp = xp * (2 + RelicCount(RELIC_SCHOLARS_LENS)) / 2; // Scholar's Lens: +50 percent per stack
+    if (Wearing(PLAYER_MASK_BUNNY)) {
+        xp = xp * 3 / 2;
+    }
+    if (Wearing(PLAYER_MASK_TRUTH) && elite) {
+        xp = xp * 3 / 2; // elites already give double: triple in total
+    }
     GainXp(play, xp);
 }
 
@@ -1846,6 +1968,13 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
         return;
     }
     int taken = -amount;
+
+    // Spooky Mask: a quarter of hits pass right through.
+    if (Wearing(PLAYER_MASK_SPOOKY) && RandInt(1, 100) <= 25) {
+        gSaveContext.health = (s16)std::min(gSaveContext.health + taken, (int)gSaveContext.healthCapacity);
+        Sfx_PlaySfxCentered(NA_SE_EN_FANTOM_LAUGH);
+        return;
+    }
 
     // Deku Bark: sometimes the hit just bounces off.
     if (HasRelic(RELIC_DEKU_BARK) && RandInt(1, 100) <= std::min(15 * RelicCount(RELIC_DEKU_BARK), 45)) {
@@ -1879,6 +2008,12 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
     if (sRun.modifier == FLOORMOD_GLASS_CANNON) {
         scaled *= 2.0f;
     }
+    if (Wearing(PLAYER_MASK_SKULL)) {
+        scaled *= 1.25f;
+    }
+    if (Wearing(PLAYER_MASK_GORON)) {
+        scaled *= 0.8f;
+    }
     int finalDamage = std::max(1, (int)lroundf(scaled));
     int delta = finalDamage - taken; // positive: extra damage, negative: damage refunded
     gSaveContext.health = (s16)std::clamp(gSaveContext.health - delta, -1, (int)gSaveContext.healthCapacity);
@@ -1887,6 +2022,11 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
         EnemyAffix affix = FindAttackingAffix(play);
         // Navi's Eye: elemental attacks often miss.
         if (affix != AFFIX_NONE && HasRelic(RELIC_NAVIS_EYE) && RandInt(0, 1) == 0) {
+            affix = AFFIX_NONE;
+        }
+        // Goron Mask: fireproof. Zora Mask: ice, shock and poison don't take.
+        if ((affix == AFFIX_FIRE && Wearing(PLAYER_MASK_GORON)) ||
+            ((affix == AFFIX_ICE || affix == AFFIX_SHOCK || affix == AFFIX_POISON) && Wearing(PLAYER_MASK_ZORA))) {
             affix = AFFIX_NONE;
         }
         if (affix != AFFIX_NONE) {
@@ -2249,6 +2389,7 @@ static void ApplyStartingLoadout() {
     gSaveContext.bgsFlag = false;
     gSaveContext.rupees = 0;
     gSaveContext.nayrusLoveTimer = 0;
+    gSaveContext.ship.maskMemory = PLAYER_MASK_NONE;
 
     // Skip the boss intro cutscenes (same flags Boss Rush uses).
     gSaveContext.eventChkInf[7] |= 0xFF;
@@ -2343,6 +2484,7 @@ static void EndRun(PlayState* play) {
     gSaveContext.magicState = MAGIC_STATE_IDLE;
     gSaveContext.nayrusLoveTimer = 0;
     gSaveContext.healthAccumulator = 0;
+    gSaveContext.ship.maskMemory = PLAYER_MASK_NONE;
 
     RespawnData* respawn = &gSaveContext.respawn[RESPAWN_MODE_DOWN];
     respawn->entranceIndex = sReturnPoint.entranceIndex;
@@ -2400,6 +2542,9 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
 
     Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
     GiveRoomClearRefill(play);
+    if (Wearing(PLAYER_MASK_BUNNY)) {
+        ApplyOwnHealthChange(play, 16); // Bunny Hood: a heart back
+    }
 
     int every = std::max(1, ROGUELIKE_REWARD_EVERY);
     if (sRun.arena) {
@@ -2726,9 +2871,15 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
         Interface_DrawTextLine(play->state.gfxCtx, (char*)twist.c_str(), 190, 210, 150, 210, 255, alpha, 0.65f, 1);
     }
 
-    // Top: the relics collected this run.
+    // Top: the mask being worn and the relics collected this run.
     std::string relics;
     int lineLength = 0;
+    for (const RoguelikeMask& mask : sMasks) {
+        if (Wearing(mask.mask)) {
+            relics = std::string("Mask: ") + mask.name;
+            lineLength = (int)relics.size();
+        }
+    }
     for (int r = 0; r < RELIC_COUNT; r++) {
         if (sRelics[r] == 0) {
             continue;
@@ -2808,6 +2959,23 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(OnPlayerHealthChange, true, OnPlayerHealthChangeRoguelike);
     COND_HOOK(OnLoadGame, true, OnLoadGameRoguelike);
     COND_HOOK(OnItemReceive, true, OnItemReceiveRoguelike);
+
+    // Masks stay on during runs: they don't come off when the mask leaves the C buttons, and they're put back on
+    // after every floor change (same idea as the Persistent Masks enhancement).
+    COND_VB_SHOULD(VB_PLAYER_UNEQUIP_MASK_WITHOUT_BUTTON, true, {
+        if (sRun.active) {
+            *should = false;
+        }
+    });
+    COND_ID_HOOK(OnActorInit, ACTOR_PLAYER, true, [](void* actorPtr) {
+        if (!sRun.active) {
+            return;
+        }
+        const RoguelikeMask* carried = FindMaskByItem(INV_CONTENT(ITEM_TRADE_CHILD));
+        if (carried != NULL && gSaveContext.ship.maskMemory == carried->mask) {
+            ((Player*)actorPtr)->currentMask = gSaveContext.ship.maskMemory;
+        }
+    });
     COND_HOOK(OnActorUpdate, true, OnActorUpdateRoguelike);
     COND_HOOK(OnActorDestroy, true, OnActorDestroyRoguelike);
     COND_HOOK(OnEnemyDefeat, true, OnEnemyDefeatRoguelike);
@@ -2816,11 +2984,12 @@ static void RegisterRoguelikeDescent() {
 
     // Pegasus Feather: a faster ground run speed. Steps aside if another speed effect already took over this frame.
     COND_VB_SHOULD(VB_PLAYER_MODIFY_RUN_SPEED, true, {
-        if (sRun.active && HasRelic(RELIC_PEGASUS_FEATHER) && *should) {
+        if (sRun.active && (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_KEATON)) && *should) {
             Player* player = va_arg(args, Player*);
             f32* speedTarget = va_arg(args, f32*);
             s16* yawTarget = va_arg(args, s16*);
-            *speedTarget *= 1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER);
+            *speedTarget *=
+                1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_KEATON) ? 0.3f : 0.0f);
             func_8083DF68(player, *speedTarget, *yawTarget);
             func_8083DDC8(player, gPlayState);
             *should = false;
