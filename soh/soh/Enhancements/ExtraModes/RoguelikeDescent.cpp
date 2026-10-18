@@ -49,7 +49,6 @@ extern "C" {
 #include "variables.h"
 #include "src/overlays/actors/ovl_En_Box/z_en_box.h"
 extern PlayState* gPlayState;
-s32 Object_Spawn(ObjectContext* objectCtx, s16 objectId);
 void func_8083DF68(Player* player, f32 arg1, s16 arg2); // Player: steer towards a speed/yaw target
 void func_8083DDC8(Player* player, PlayState* play);
 }
@@ -1388,15 +1387,11 @@ static RoomRemix RollRoomRemix() {
     return (RoomRemix)RandInt(REMIX_NONE + 1, REMIX_MAX - 1);
 }
 
-// Most props check that their model data is loaded when they appear, so load it first if this room doesn't have it.
-static bool EnsureObjectLoaded(PlayState* play, s16 objectId) {
-    if (Object_GetIndex(&play->objectCtx, objectId) >= 0) {
-        return true;
-    }
-    if (play->objectCtx.num >= OBJECT_EXCHANGE_BANK_MAX - 1) {
-        return false; // no room for another object in this scene
-    }
-    Object_Spawn(&play->objectCtx, objectId);
+// Props are spawned the same way the Enemy Randomizer spawns enemies: without loading their object into the room.
+// SoH draws them from their resources by name, so that works for actors that don't check for their object
+// themselves. Actors that do check (pots, scythes) are only used where the room already has their object.
+// (Loading extra objects into a room mid-floor can overflow the room's object memory and crash the renderer.)
+static bool IsObjectLoaded(PlayState* play, s16 objectId) {
     return Object_GetIndex(&play->objectCtx, objectId) >= 0;
 }
 
@@ -1420,10 +1415,7 @@ static bool FindRemixSpot(PlayState* play, f32 minRadius, f32 maxRadius, f32 spa
     return false;
 }
 
-static Actor* SpawnProp(PlayState* play, s16 actorId, s16 objectId, Vec3f pos, s16 yaw, s16 params, bool hazard) {
-    if (!EnsureObjectLoaded(play, objectId)) {
-        return NULL;
-    }
+static Actor* SpawnProp(PlayState* play, s16 actorId, Vec3f pos, s16 yaw, s16 params, bool hazard) {
     Actor* actor = Actor_Spawn(&play->actorCtx, play, actorId, pos.x, pos.y, pos.z, 0, yaw, 0, params);
     if (actor != NULL && hazard) {
         sRemixHazards.push_back(actor);
@@ -1432,6 +1424,15 @@ static Actor* SpawnProp(PlayState* play, s16 actorId, s16 objectId, Vec3f pos, s
 }
 
 static void SpawnPots(PlayState* play, int count) {
+    // Pots need their model loaded: the dungeon pot (shared dungeon object) or the stand-alone pot (0x100).
+    s16 potModel;
+    if (IsObjectLoaded(play, OBJECT_GAMEPLAY_DANGEON_KEEP)) {
+        potModel = 0;
+    } else if (IsObjectLoaded(play, OBJECT_TSUBO)) {
+        potModel = 0x100;
+    } else {
+        return;
+    }
     for (int i = 0; i < count; i++) {
         Vec3f pos;
         if (!FindRemixSpot(play, 110.0f, 380.0f, 60.0f, &pos)) {
@@ -1440,16 +1441,23 @@ static void SpawnPots(PlayState* play, int count) {
         // Mostly hearts, sometimes magic or rupees. 0x100 = use the stand-alone pot model.
         int roll = RandInt(1, 100);
         s16 drop = (roll <= 65) ? ITEM00_HEART : (roll <= 80 ? ITEM00_MAGIC_SMALL : ITEM00_RUPEE_GREEN);
-        SpawnProp(play, ACTOR_OBJ_TSUBO, OBJECT_TSUBO, pos, 0, (s16)(0x100 | drop), false);
+        SpawnProp(play, ACTOR_OBJ_TSUBO, pos, 0, (s16)(potModel | drop), false);
     }
 }
 
+static void SpawnSpikeTraps(PlayState* play, int count);
+
 static void SpawnBlades(PlayState* play, int count) {
+    // The scythe needs the Shadow Temple's object; elsewhere, spike traps take its place.
+    if (!IsObjectLoaded(play, OBJECT_HAKA_OBJECTS)) {
+        SpawnSpikeTraps(play, count + 1);
+        return;
+    }
     for (int i = 0; i < count; i++) {
         Vec3f pos;
         if (FindRemixSpot(play, 180.0f, 420.0f, 170.0f, &pos)) {
             // Visible Shadow Temple scythe.
-            SpawnProp(play, ACTOR_BG_HAKA_SGAMI, OBJECT_HAKA_OBJECTS, pos, (s16)RandInt(0, 0xFFFF), 0, true);
+            SpawnProp(play, ACTOR_BG_HAKA_SGAMI, pos, (s16)RandInt(0, 0xFFFF), 0, true);
         }
     }
 }
@@ -1470,7 +1478,7 @@ static void SpawnSpikeTraps(PlayState* play, int count) {
             int upper = (4 << 4) | 8; // 160 units, speed 8
             params = (s16)((upper << 8) | 0xF);
         }
-        SpawnProp(play, ACTOR_EN_TRAP, OBJECT_TRAP, pos, (s16)(RandInt(0, 3) * 0x4000), params, true);
+        SpawnProp(play, ACTOR_EN_TRAP, pos, (s16)(RandInt(0, 3) * 0x4000), params, true);
     }
 }
 
@@ -1478,7 +1486,7 @@ static void SpawnPillars(PlayState* play, int count) {
     for (int i = 0; i < count; i++) {
         Vec3f pos;
         if (FindRemixSpot(play, 120.0f, 360.0f, 130.0f, &pos)) {
-            SpawnProp(play, ACTOR_OBJ_HSBLOCK, OBJECT_D_HSBLOCK, pos, 0, 0, false);
+            SpawnProp(play, ACTOR_OBJ_HSBLOCK, pos, 0, 0, false);
         }
     }
 }
