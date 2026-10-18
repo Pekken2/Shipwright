@@ -1964,6 +1964,17 @@ void SohMenu::AddMenuEnhancements() {
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "Floors can roll a twist (more often deeper down): Mirror World, Giants, Glass Cannon, Swarm, "
             "Elite Floor or Hasty. The twist is announced when you land and shown on the pause screen."));
+    AddWidget(path, "Room Remixes", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.RoomRemix"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Rooms can get a new layout on top of the dungeon's own: pots full of hearts, spinning scythes, spike "
+            "traps, pillars for cover, or a gauntlet of everything. Traps disappear once the room is cleared."));
+    AddWidget(path, "Arena Floors", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Arenas"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "From floor 3, some floors are survival arenas out in the world (Hyrule Field, Lon Lon Ranch, Sacred "
+            "Forest Meadow, Lake Hylia, Desert Colossus, Kakariko Graveyard) with extra waves. Surviving always "
+            "gives a reward. Leaving the area counts as fleeing: no reward."));
     AddWidget(path, "Restart Run Automatically on Death", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.AutoRestart"))
         .Options(

@@ -46,6 +46,7 @@ extern "C" {
 #include "variables.h"
 #include "src/overlays/actors/ovl_En_Box/z_en_box.h"
 extern PlayState* gPlayState;
+s32 Object_Spawn(ObjectContext* objectCtx, s16 objectId);
 }
 
 #define CVAR_ROGUELIKE(name) CVAR_ENHANCEMENT("Roguelike." name)
@@ -59,6 +60,8 @@ extern PlayState* gPlayState;
 #define ROGUELIKE_BOSS_FLOORS CVarGetInteger(CVAR_ROGUELIKE("BossFloors"), 1)
 #define ROGUELIKE_BOSS_EVERY CVarGetInteger(CVAR_ROGUELIKE("BossEvery"), 5)
 #define ROGUELIKE_MODIFIERS CVarGetInteger(CVAR_ROGUELIKE("Modifiers"), 1)
+#define ROGUELIKE_ROOM_REMIX CVarGetInteger(CVAR_ROGUELIKE("RoomRemix"), 1)
+#define ROGUELIKE_ARENAS CVarGetInteger(CVAR_ROGUELIKE("Arenas"), 1)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -193,6 +196,16 @@ typedef enum {
     FLOORMOD_MAX,
 } FloorModifier;
 
+typedef enum {
+    REMIX_NONE,
+    REMIX_POTS,     // pots with hearts
+    REMIX_BLADES,   // spinning scythes
+    REMIX_SPIKES,   // spike traps
+    REMIX_PILLARS,  // pillars for cover
+    REMIX_GAUNTLET, // a bit of everything
+    REMIX_MAX,
+} RoomRemix;
+
 typedef struct {
     s32 entranceIndex;
     s8 roomIndex;
@@ -217,7 +230,13 @@ static struct {
     bool bossDefeated;
     int bossWaitFrames;     // frames since the boss fell, so its death scene can play out
     FloorModifier modifier; // this floor's twist, if any
+    RoomRemix remix;        // this floor's prop/trap layout, if any
+    bool arena;             // an open-world survival floor
+    s16 expectedScene;      // where this floor takes place; landing anywhere else means Link left (fled)
+    bool fled;
 } sRun;
+
+static std::vector<Actor*> sArenaEnemies; // on arena floors only the enemies we spawned have to be beaten
 
 static SaveContext sSnapshot;
 static ReturnPoint sReturnPoint;
@@ -1050,6 +1069,9 @@ static int WavesForFloor(int floor) {
 
 static int EnemiesPerWave(int floor) {
     int count = std::min(2 + floor / 3, 6);
+    if (sRun.arena) {
+        count = std::min(count + 2, 8);
+    }
     if (sRun.modifier == FLOORMOD_SWARM) {
         count = std::min(count * 2, 10);
     }
@@ -1062,6 +1084,9 @@ static int MaxTierForFloor(int floor) {
 
 // Enemies appear on Link's floor with no wall in between, so they are reachable and in this room.
 static bool FindEnemySpawnSpot(PlayState* play, Vec3f* outPos) {
+    if (sRun.arena) {
+        return FindFloorSpotNearPlayer(play, 200.0f, 500.0f, outPos);
+    }
     return FindFloorSpotNearPlayer(play, 150.0f, 380.0f, outPos);
 }
 
@@ -1084,8 +1109,180 @@ static void SpawnWave(PlayState* play) {
         }
 
         s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos);
-        Actor_Spawn(&play->actorCtx, play, enemy.actorId, pos.x, pos.y, pos.z, 0, yaw, 0, enemy.params);
+        Actor* spawned =
+            Actor_Spawn(&play->actorCtx, play, enemy.actorId, pos.x, pos.y, pos.z, 0, yaw, 0, enemy.params);
+        if (spawned != NULL && sRun.arena) {
+            sArenaEnemies.push_back(spawned);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Room remixes: a themed layout of props and traps dropped around the room, built from existing actors.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static const char* sRemixNames[REMIX_MAX] = {
+    "", "Pottery", "Whirling Blades", "Spike Traps", "Pillars", "Gauntlet",
+};
+static const char* sRemixDescriptions[REMIX_MAX] = {
+    "",
+    "Smash the pots for hearts.",
+    "Spinning scythes sweep the room.",
+    "Spiked traps slide and circle around.",
+    "Pillars rise from the floor - use them as cover.",
+    "Blades, spikes and a few pots.",
+};
+
+static std::vector<Actor*> sRemixHazards; // traps to clear away once the room is beaten
+static std::vector<Vec3f> sRemixSpots;    // where props went, to keep them apart
+static bool sRemixApplied = false;
+
+static RoomRemix RollRoomRemix() {
+    if (!ROGUELIKE_ROOM_REMIX || RandInt(1, 100) > 50) {
+        return REMIX_NONE;
+    }
+    return (RoomRemix)RandInt(REMIX_NONE + 1, REMIX_MAX - 1);
+}
+
+// Most props check that their model data is loaded when they appear, so load it first if this room doesn't have it.
+static bool EnsureObjectLoaded(PlayState* play, s16 objectId) {
+    if (Object_GetIndex(&play->objectCtx, objectId) >= 0) {
+        return true;
+    }
+    if (play->objectCtx.num >= OBJECT_EXCHANGE_BANK_MAX - 1) {
+        return false; // no room for another object in this scene
+    }
+    Object_Spawn(&play->objectCtx, objectId);
+    return Object_GetIndex(&play->objectCtx, objectId) >= 0;
+}
+
+static bool FindRemixSpot(PlayState* play, f32 minRadius, f32 maxRadius, f32 spacing, Vec3f* outPos) {
+    for (int attempt = 0; attempt < 12; attempt++) {
+        if (!FindFloorSpotNearPlayer(play, minRadius, maxRadius, outPos)) {
+            continue;
+        }
+        bool clear = true;
+        for (const Vec3f& other : sRemixSpots) {
+            if (Math_Vec3f_DistXZ(outPos, (Vec3f*)&other) < spacing) {
+                clear = false;
+                break;
+            }
+        }
+        if (clear) {
+            sRemixSpots.push_back(*outPos);
+            return true;
+        }
+    }
+    return false;
+}
+
+static Actor* SpawnProp(PlayState* play, s16 actorId, s16 objectId, Vec3f pos, s16 yaw, s16 params, bool hazard) {
+    if (!EnsureObjectLoaded(play, objectId)) {
+        return NULL;
+    }
+    Actor* actor = Actor_Spawn(&play->actorCtx, play, actorId, pos.x, pos.y, pos.z, 0, yaw, 0, params);
+    if (actor != NULL && hazard) {
+        sRemixHazards.push_back(actor);
+    }
+    return actor;
+}
+
+static void SpawnPots(PlayState* play, int count) {
+    for (int i = 0; i < count; i++) {
+        Vec3f pos;
+        if (!FindRemixSpot(play, 110.0f, 380.0f, 60.0f, &pos)) {
+            continue;
+        }
+        // Mostly hearts, sometimes magic or rupees. 0x100 = use the stand-alone pot model.
+        int roll = RandInt(1, 100);
+        s16 drop = (roll <= 65) ? ITEM00_HEART : (roll <= 80 ? ITEM00_MAGIC_SMALL : ITEM00_RUPEE_GREEN);
+        SpawnProp(play, ACTOR_OBJ_TSUBO, OBJECT_TSUBO, pos, 0, (s16)(0x100 | drop), false);
+    }
+}
+
+static void SpawnBlades(PlayState* play, int count) {
+    for (int i = 0; i < count; i++) {
+        Vec3f pos;
+        if (FindRemixSpot(play, 180.0f, 420.0f, 170.0f, &pos)) {
+            // Visible Shadow Temple scythe.
+            SpawnProp(play, ACTOR_BG_HAKA_SGAMI, OBJECT_HAKA_OBJECTS, pos, (s16)RandInt(0, 0xFFFF), 0, true);
+        }
+    }
+}
+
+static void SpawnSpikeTraps(PlayState* play, int count) {
+    for (int i = 0; i < count; i++) {
+        Vec3f pos;
+        if (!FindRemixSpot(play, 150.0f, 400.0f, 140.0f, &pos)) {
+            continue;
+        }
+        s16 params;
+        if (RandInt(0, 1) == 0) {
+            // Circles around its spot: low nibble = radius (x40 units), high nibble = speed.
+            int upper = (RandInt(0, 2) << 4) | RandInt(1, 2);
+            params = (s16)((upper << 8) | 0x20);
+        } else {
+            // Classic blade trap: charges in any of 4 directions when Link lines up with it.
+            int upper = (4 << 4) | 8; // 160 units, speed 8
+            params = (s16)((upper << 8) | 0xF);
+        }
+        SpawnProp(play, ACTOR_EN_TRAP, OBJECT_TRAP, pos, (s16)(RandInt(0, 3) * 0x4000), params, true);
+    }
+}
+
+static void SpawnPillars(PlayState* play, int count) {
+    for (int i = 0; i < count; i++) {
+        Vec3f pos;
+        if (FindRemixSpot(play, 120.0f, 360.0f, 130.0f, &pos)) {
+            SpawnProp(play, ACTOR_OBJ_HSBLOCK, OBJECT_D_HSBLOCK, pos, 0, 0, false);
+        }
+    }
+}
+
+static void ApplyRoomRemix(PlayState* play) {
+    if (sRemixApplied || sRun.remix == REMIX_NONE) {
+        return;
+    }
+    sRemixApplied = true;
+    sRemixSpots.clear();
+    Notify(std::string("Room remix: ") + sRemixNames[sRun.remix] + ". ", sRemixDescriptions[sRun.remix]);
+
+    int extra = std::min(sRun.floor / 6, 2); // a bit busier deeper down
+    switch (sRun.remix) {
+        case REMIX_POTS:
+            SpawnPots(play, 6 + extra);
+            break;
+        case REMIX_BLADES:
+            SpawnBlades(play, 2 + extra);
+            break;
+        case REMIX_SPIKES:
+            SpawnSpikeTraps(play, 3 + extra);
+            break;
+        case REMIX_PILLARS:
+            SpawnPillars(play, 4 + extra);
+            break;
+        case REMIX_GAUNTLET:
+            SpawnBlades(play, 1 + extra / 2);
+            SpawnSpikeTraps(play, 2 + extra / 2);
+            SpawnPots(play, 3);
+            break;
+        default:
+            break;
+    }
+}
+
+// Once the room is beaten, the traps go away so opening chests is safe.
+static void ClearRemixHazards(PlayState* play) {
+    for (Actor* hazard : sRemixHazards) {
+        if (hazard != NULL) {
+            Vec3f pos = hazard->world.pos;
+            pos.y += 20.0f;
+            Vec3f zero = { 0.0f, 0.0f, 0.0f };
+            EffectSsDeadDb_Spawn(play, &pos, &zero, &zero, 100, 0, 255, 255, 255, 255, 0, 0, 255, 1, 9, true);
+            Actor_Kill(hazard);
+        }
+    }
+    sRemixHazards.clear();
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1274,6 +1471,8 @@ static void OnActorUpdateRoguelike(void* refActor) {
 
 static void OnActorDestroyRoguelike(void* refActor) {
     sEnemies.erase((Actor*)refActor);
+    sArenaEnemies.erase(std::remove(sArenaEnemies.begin(), sArenaEnemies.end(), (Actor*)refActor), sArenaEnemies.end());
+    std::replace(sRemixHazards.begin(), sRemixHazards.end(), (Actor*)refActor, (Actor*)NULL);
     for (int i = 0; i < sChoiceCount; i++) {
         if (sChoiceChests[i].actor == refActor) {
             sChoiceChests[i].actor = NULL;
@@ -1514,6 +1713,9 @@ static s32 PrepareBossFloor() {
     sRun.bossDefeated = false;
     sRun.bossWaitFrames = 0;
     sRun.modifier = FLOORMOD_NONE;
+    sRun.remix = REMIX_NONE;
+    sRun.arena = false;
+    sRun.expectedScene = boss.sceneNum;
 
     Notify("Floor " + std::to_string(sRun.floor) + ": BOSS - ", boss.name);
     return boss.entrance;
@@ -1524,6 +1726,42 @@ static void OnBossDefeatRoguelike(void* refActor) {
         sRun.bossDefeated = true;
         sRun.bossWaitFrames = 0;
     }
+}
+
+// Arena floors: survival fights out in the open world.
+typedef struct {
+    s16 sceneNum;
+    s32 entrance;
+    const char* name;
+} RoguelikeArena;
+
+static const RoguelikeArena sArenas[] = {
+    { SCENE_HYRULE_FIELD, ENTR_HYRULE_FIELD_PAST_BRIDGE_SPAWN, "Hyrule Field" },
+    { SCENE_LON_LON_RANCH, ENTR_LON_LON_RANCH_ENTRANCE, "Lon Lon Ranch" },
+    { SCENE_SACRED_FOREST_MEADOW, ENTR_SACRED_FOREST_MEADOW_SOUTH_EXIT, "Sacred Forest Meadow" },
+    { SCENE_LAKE_HYLIA, ENTR_LAKE_HYLIA_NORTH_EXIT, "Lake Hylia" },
+    { SCENE_DESERT_COLOSSUS, ENTR_DESERT_COLOSSUS_EAST_EXIT, "Desert Colossus" },
+    { SCENE_GRAVEYARD, ENTR_GRAVEYARD_ENTRANCE, "Kakariko Graveyard" },
+};
+
+static bool IsArenaFloor(int floor) {
+    return ROGUELIKE_ARENAS && floor >= 3 && RandInt(1, 100) <= 15;
+}
+
+static s32 PrepareArenaFloor() {
+    const RoguelikeArena& arena = sArenas[RandInt(0, (int)ARRAY_COUNT(sArenas) - 1)];
+    sPendingRoomPick = false;
+    sRun.arena = true;
+    sRun.expectedScene = arena.sceneNum;
+    SetEquipValue(EQUIP_TYPE_TUNIC, EQUIP_VALUE_TUNIC_KOKIRI);
+
+    // Fight in daylight.
+    gSaveContext.dayTime = 0x8000;
+    gSaveContext.nightFlag = 0;
+
+    Notify("Floor " + std::to_string(sRun.floor) + ": ARENA - ", arena.name);
+    Notify("Survive the waves! ", "Leaving the area counts as fleeing.");
+    return arena.entrance;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1551,6 +1789,16 @@ static s32 PrepareNextFloor() {
     }
     sRun.bossFloor = false;
     sRun.modifier = RollFloorModifier(sRun.floor);
+    sRun.remix = RollRoomRemix();
+
+    if (IsArenaFloor(sRun.floor)) {
+        s32 entrance = PrepareArenaFloor();
+        if (sRun.modifier != FLOORMOD_NONE) {
+            Notify(std::string(sModifierNames[sRun.modifier]) + "! ", sModifierDescriptions[sRun.modifier]);
+        }
+        return entrance;
+    }
+    sRun.arena = false;
 
     int unlocked = std::min((int)ARRAY_COUNT(sDungeons), 4 + ((sRun.floor - 1) / 3) * 2);
     int dungeon = RandInt(0, unlocked - 1);
@@ -1560,6 +1808,7 @@ static s32 PrepareNextFloor() {
 
     sPendingRoomPick = true;
     sPendingScene = d.sceneNum;
+    sRun.expectedScene = d.sceneNum;
     sRun.lastDungeon = dungeon;
 
     Notify("Floor " + std::to_string(sRun.floor) + ": ", d.name);
@@ -1642,6 +1891,10 @@ static void ResetRunState() {
     sRun.bossDefeated = false;
     sRun.bossWaitFrames = 0;
     sRun.modifier = FLOORMOD_NONE;
+    sRun.remix = REMIX_NONE;
+    sRun.arena = false;
+    sRun.expectedScene = -1;
+    sRun.fled = false;
     sLastBoss = -1;
     sChoiceCount = 0;
     ResetLeveling();
@@ -1754,6 +2007,7 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
     EnterRoomState(ROOM_STATE_CLEARED);
     SaveBestFloor(sRun.floor);
     sRun.chestFlag = CHEST_NONE;
+    ClearRemixHazards(play);
 
     if (timedOut) {
         Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
@@ -1765,7 +2019,11 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
     GiveRoomClearRefill(play);
 
     int every = std::max(1, ROGUELIKE_REWARD_EVERY);
-    if (sRun.floor % every == 0) {
+    if (sRun.arena) {
+        Notify("Arena survived! ", "Bonus XP and a reward.");
+        GainXp(play, 40 + 10 * sRun.floor);
+    }
+    if (sRun.arena || sRun.floor % every == 0) {
         if (SpawnRewardChoice(play)) {
             Notify("Choose your reward! ", "Open one chest - the others will vanish.");
         } else {
@@ -1850,6 +2108,16 @@ static void OnPlayerUpdateRoguelike() {
         return;
     }
 
+    if (sRun.fled) {
+        // Link walked out through a loading zone: no reward, straight on to the next floor.
+        sRun.fled = false;
+        if (sRun.roomState != ROOM_STATE_RUN_OVER) {
+            Notify("You fled the floor. ", "No reward this time.");
+            GoToNextFloor(play);
+            return;
+        }
+    }
+
     sRun.roomFrames++;
     sRun.stateFrames++;
     UpdateLeveling(play);
@@ -1857,6 +2125,7 @@ static void OnPlayerUpdateRoguelike() {
     switch (sRun.roomState) {
         case ROOM_STATE_ENTERING:
             if (sRun.stateFrames >= WAVE_SPAWN_DELAY) {
+                ApplyRoomRemix(play);
                 SpawnWave(play);
                 sRun.wavesLeft--;
                 EnterRoomState(ROOM_STATE_FIGHTING);
@@ -1867,7 +2136,9 @@ static void OnPlayerUpdateRoguelike() {
             if (sRun.roomFrames < CLEAR_CHECK_DELAY) {
                 break;
             }
-            if (play->actorCtx.actorLists[ACTORCAT_ENEMY].length == 0) {
+            // In arenas only our waves count; the open world is full of enemies that wander far away.
+            bool roomEmpty = sRun.arena ? sArenaEnemies.empty() : play->actorCtx.actorLists[ACTORCAT_ENEMY].length == 0;
+            if (roomEmpty) {
                 if (sRun.wavesLeft > 0) {
                     sRun.wavesLeft--;
                     Sfx_PlaySfxCentered(NA_SE_SY_WARNING_COUNT_N);
@@ -1878,6 +2149,9 @@ static void OnPlayerUpdateRoguelike() {
                 break;
             }
             int limit = ROGUELIKE_ROOM_TIME_LIMIT;
+            if (sRun.arena && limit > 0) {
+                limit = std::max(limit, 180); // arenas have more to fight
+            }
             if (sRun.modifier == FLOORMOD_HASTY) {
                 limit = 45;
             }
@@ -1945,6 +2219,15 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sNewElites.clear();
     sPendingAffix = AFFIX_NONE;
     sChoiceCount = 0;
+    sArenaEnemies.clear();
+    sRemixHazards.clear();
+    sRemixApplied = false;
+    if (sRun.arena) {
+        sRun.wavesLeft = WavesForFloor(sRun.floor) + 2;
+    }
+    if (sRun.expectedScene >= 0 && sceneNum != sRun.expectedScene) {
+        sRun.fled = true;
+    }
     if (sRun.roomState != ROOM_STATE_RUN_OVER) {
         if (sRun.bossFloor) {
             sRun.wavesLeft = 0;
@@ -2018,8 +2301,21 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
                       PRIMITIVE, 0);
     CLOSE_DISPS(play->state.gfxCtx);
 
-    if (sRun.bossFloor || sRun.modifier != FLOORMOD_NONE) {
-        std::string twist = sRun.bossFloor ? std::string("Boss floor") : std::string(sModifierNames[sRun.modifier]);
+    std::string twist;
+    auto addTwist = [&twist](const std::string& part) { twist += (twist.empty() ? "" : ", ") + part; };
+    if (sRun.bossFloor) {
+        addTwist("Boss floor");
+    }
+    if (sRun.arena) {
+        addTwist("Arena");
+    }
+    if (sRun.modifier != FLOORMOD_NONE) {
+        addTwist(sModifierNames[sRun.modifier]);
+    }
+    if (sRun.remix != REMIX_NONE) {
+        addTwist(sRemixNames[sRun.remix]);
+    }
+    if (!twist.empty()) {
         Interface_DrawTextLine(play->state.gfxCtx, (char*)twist.c_str(), 190, 210, 150, 210, 255, alpha, 0.65f, 1);
     }
 
