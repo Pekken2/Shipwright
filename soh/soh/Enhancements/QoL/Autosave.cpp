@@ -1,4 +1,5 @@
 #include <libultraship/bridge/consolevariablebridge.h>
+#include "soh/Enhancements/ExtraModes/RoguelikeDescent.h"
 
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/Notification/Notification.h"
@@ -33,7 +34,9 @@ static bool Autosave_CanSave() {
     if (!GameInteractor::IsSaveLoaded(false) || !SaveManager::Instance->SaveFile_Exist(gSaveContext.fileNum) ||
         gPlayState->gameplayFrames < 60 || gPlayState->sceneNum == SCENE_CHAMBER_OF_THE_SAGES ||
         gPlayState->sceneNum == SCENE_CUTSCENE_MAP ||
-        (!CHECK_QUEST_ITEM(QUEST_SONG_TIME) && (INV_CONTENT(ITEM_OCARINA_TIME) == ITEM_OCARINA_TIME))) {
+        (!CHECK_QUEST_ITEM(QUEST_SONG_TIME) && (INV_CONTENT(ITEM_OCARINA_TIME) == ITEM_OCARINA_TIME)) ||
+        // Never save a Roguelike Descent run over the real save.
+        Roguelike_IsRunActive()) {
         return false;
     }
 

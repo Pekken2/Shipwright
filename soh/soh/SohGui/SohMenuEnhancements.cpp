@@ -14,6 +14,7 @@
 #include <libultraship/bridge/consolevariablebridge.h>
 #include <soh/ResourceManagerHelpers.h>
 #include "soh/ShipInit.hpp"
+#include "soh/Enhancements/ExtraModes/RoguelikeDescent.h"
 
 extern "C" {
 #include "functions.h"
@@ -1881,6 +1882,49 @@ void SohMenu::AddMenuEnhancements() {
                      .DefaultValue(5)
                      .Format("%d seconds")
                      .Tooltip("Interval between Rupee reduction in Rupee Dash Mode."));
+    AddWidget(path, "Roguelike Descent", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "Start Roguelike Run", WIDGET_BUTTON)
+        .Callback([](WidgetInfo& info) { Roguelike_RequestStartRun(); })
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = Roguelike_IsRunActive();
+            info.options->disabled = !GameInteractor::IsSaveLoaded(false);
+            info.options->disabledTooltip = "Load a save file first.";
+        })
+        .Options(ButtonOptions().Tooltip(
+            "Room-by-room roguelike. Link is dropped into a random room of a random dungeon with the doors sealed. "
+            "Defeat every enemy to descend to the next floor. Floors get harder, you get items along the way, and "
+            "dying ends the run.\n\n"
+            "Your save is snapshotted when the run starts and restored when it ends, and saving is blocked during "
+            "the run, so your real progress is never touched."));
+    AddWidget(path, "Abandon Run", WIDGET_BUTTON)
+        .Callback([](WidgetInfo& info) { Roguelike_RequestAbandonRun(); })
+        .PreFunc([](WidgetInfo& info) { info.isHidden = !Roguelike_IsRunActive(); })
+        .Options(ButtonOptions().Tooltip("End the current run and return to where you started it."));
+    AddWidget(path, "Roguelike Status", WIDGET_TEXT).PreFunc([](WidgetInfo& info) {
+        if (Roguelike_IsRunActive()) {
+            info.name = "Floor " + std::to_string(Roguelike_GetCurrentFloor()) +
+                        "   (best: " + std::to_string(Roguelike_GetBestFloor()) + ")";
+        } else {
+            info.name = "Best floor reached: " + std::to_string(Roguelike_GetBestFloor());
+        }
+    });
+    AddWidget(path, "Starting Hearts: %d", WIDGET_CVAR_SLIDER_INT)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.StartHearts"))
+        .Options(IntSliderOptions().Min(1).Max(10).DefaultValue(3).Format("%d").Tooltip(
+            "Heart containers Link starts each run with."));
+    AddWidget(path, "Room Time Limit: %d seconds", WIDGET_CVAR_SLIDER_INT)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.RoomTimeLimit"))
+        .Options(IntSliderOptions().Min(0).Max(300).DefaultValue(120).Format("%d seconds").Tooltip(
+            "If a room isn't cleared in this time, the floor gives way and you descend without a reward. "
+            "This also rescues you from rooms with an enemy you can't reach. 0 = no limit."));
+    AddWidget(path, "Item Reward Every %d Floors", WIDGET_CVAR_SLIDER_INT)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.RewardEvery"))
+        .Options(IntSliderOptions().Min(1).Max(5).DefaultValue(2).Format("%d").Tooltip(
+            "How often clearing a floor gives a random item (bow, hookshot, magic, heart containers...)."));
+    AddWidget(path, "Restart Run Automatically on Death", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.AutoRestart"))
+        .Options(CheckboxOptions().Tooltip(
+            "Immediately start a fresh run when you die instead of returning to your save."));
     AddWidget(path, "Shadow Tag Mode", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("ShadowTag"))
         .Options(CheckboxOptions().Tooltip("A Wallmaster follows Link everywhere, don't get caught!"));
