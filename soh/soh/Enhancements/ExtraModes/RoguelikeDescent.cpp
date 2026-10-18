@@ -34,6 +34,8 @@
 #include <vector>
 
 #include "soh/Enhancements/cosmetics/authenticGfxPatches.h"
+#include "soh/Enhancements/custom-message/CustomMessageManager.h"
+#include "soh/Enhancements/custom-message/CustomMessageTypes.h"
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/ObjectExtension/ActorMaximumHealth.h"
 #include "soh/Notification/Notification.h"
@@ -48,6 +50,8 @@ extern "C" {
 #include "src/overlays/actors/ovl_En_Box/z_en_box.h"
 extern PlayState* gPlayState;
 s32 Object_Spawn(ObjectContext* objectCtx, s16 objectId);
+void func_8083DF68(Player* player, f32 arg1, s16 arg2); // Player: steer towards a speed/yaw target
+void func_8083DDC8(Player* player, PlayState* play);
 }
 
 #define CVAR_ROGUELIKE(name) CVAR_ENHANCEMENT("Roguelike." name)
@@ -63,6 +67,7 @@ s32 Object_Spawn(ObjectContext* objectCtx, s16 objectId);
 #define ROGUELIKE_MODIFIERS CVarGetInteger(CVAR_ROGUELIKE("Modifiers"), 1)
 #define ROGUELIKE_ROOM_REMIX CVarGetInteger(CVAR_ROGUELIKE("RoomRemix"), 1)
 #define ROGUELIKE_ARENAS CVarGetInteger(CVAR_ROGUELIKE("Arenas"), 1)
+#define ROGUELIKE_RELICS CVarGetInteger(CVAR_ROGUELIKE("Relics"), 1)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -275,6 +280,122 @@ static void Notify(const std::string& message, const std::string& suffix = "", c
         .suffix = suffix,
         .remainingTime = 6.0f,
     });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Relics: passive, stackable powers for the current run (Binding of Isaac style).
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef enum {
+    RELIC_NONE = -1,
+    RELIC_GORON_FIST,      // +25 percent damage per stack
+    RELIC_EMBER_EDGE,      // hits can set enemies on fire
+    RELIC_FROSTBITE,       // hits can freeze enemies
+    RELIC_BOMBCHU_HEART,   // enemies explode when they die
+    RELIC_TWIN_ARROWS,     // arrows often aren't used up
+    RELIC_DEKU_BARK,       // chance to ignore a hit
+    RELIC_THORN_MAIL,      // attackers get hurt back
+    RELIC_VAMPIRE_FANG,    // kills heal
+    RELIC_SECOND_WIND,     // survive a killing blow (one charge per stack)
+    RELIC_PEGASUS_FEATHER, // run faster
+    RELIC_LUCKY_CLOVER,    // more chests, more choices
+    RELIC_SCHOLARS_LENS,   // more XP
+    RELIC_NAVIS_EYE,       // elemental attacks often miss
+    RELIC_GLASS_SWORD,     // double damage, half hearts
+    RELIC_CURSED_MASK,     // every floor twisted, richer rewards
+    RELIC_COUNT,
+} Relic;
+
+typedef struct {
+    const char* name;
+    const char* shortName; // for the pause screen list
+    const char* description;
+    int maxStacks;
+    bool devil; // offered in devil deals
+} RelicInfo;
+
+// Descriptions avoid the percent sign: it starts a colour code in the game's text boxes.
+static const RelicInfo sRelicInfo[RELIC_COUNT] = {
+    { "Goron Fist", "Fist", "Deal 25 percent more damage.", 4, true },
+    { "Ember Edge", "Ember", "Your hits can set enemies on fire.", 3, false },
+    { "Frostbite", "Frost", "Your hits can freeze enemies solid.", 3, false },
+    { "Bombchu Heart", "Bombchu", "Enemies explode when they die, hurting others nearby.", 2, true },
+    { "Twin Arrows", "Twin", "Arrows are often not used up.", 2, false },
+    { "Deku Bark", "Bark", "Sometimes shrug off a hit completely.", 3, false },
+    { "Thorn Mail", "Thorns", "Enemies that hurt you get hurt back.", 3, false },
+    { "Vampire Fang", "Fang", "Every kill heals a quarter heart.", 4, true },
+    { "Second Wind", "2nd Wind", "Survive one killing blow.", 2, true },
+    { "Pegasus Feather", "Pegasus", "Run 20 percent faster.", 3, false },
+    { "Lucky Clover", "Clover", "More treasure chests, and more rewards to choose from.", 3, false },
+    { "Scholar's Lens", "Scholar", "Gain 50 percent more XP.", 3, false },
+    { "Navi's Eye", "Navi", "Elemental attacks often miss you.", 1, false },
+    { "Glass Sword", "Glass", "Double damage, but your heart containers are halved.", 1, true },
+    { "Cursed Mask", "Curse", "Every floor is twisted, but rewards are richer.", 1, true },
+};
+
+static int sRelics[RELIC_COUNT];
+static Relic sPendingRelicText = RELIC_NONE; // relic whose get-item text box is about to open
+
+static int RelicCount(Relic relic) {
+    return sRelics[relic];
+}
+
+static bool HasRelic(Relic relic) {
+    return sRelics[relic] > 0;
+}
+
+// A relic Link can still take more of. Devil deals draw from the strong ones.
+static Relic PickRelic(bool devilDeal, const std::vector<Relic>& exclude) {
+    std::vector<Relic> pool;
+    for (int r = 0; r < RELIC_COUNT; r++) {
+        Relic relic = (Relic)r;
+        if (sRelics[r] >= sRelicInfo[r].maxStacks || (devilDeal && !sRelicInfo[r].devil)) {
+            continue;
+        }
+        if (std::find(exclude.begin(), exclude.end(), relic) != exclude.end()) {
+            continue;
+        }
+        pool.push_back(relic);
+    }
+    if (pool.empty()) {
+        return RELIC_NONE;
+    }
+    std::uniform_int_distribution<int> dist(0, (int)pool.size() - 1);
+    return pool[dist(sRng)];
+}
+
+static void GrantRelic(PlayState* play, Relic relic) {
+    if (relic == RELIC_NONE) {
+        return;
+    }
+    sRelics[relic]++;
+
+    if (relic == RELIC_GLASS_SWORD) {
+        // Half the heart containers (at least one), rounded down to whole hearts.
+        s16 halved = (s16)std::max(16, ((gSaveContext.healthCapacity / 2) / 16) * 16);
+        gSaveContext.healthCapacity = halved;
+        gSaveContext.health = std::min(gSaveContext.health, halved);
+    }
+
+    std::string name = sRelicInfo[relic].name;
+    if (sRelics[relic] > 1) {
+        name += " x" + std::to_string(sRelics[relic]);
+    }
+    Notify("Relic: " + name + ". ", sRelicInfo[relic].description);
+}
+
+// Shows the relic's name and effect instead of the stand-in purple rupee's text when a relic chest is opened.
+static void BuildRelicMessage(uint16_t* textId, bool* loadFromMessageTable) {
+    if (!sRun.active || sPendingRelicText == RELIC_NONE) {
+        return;
+    }
+    const RelicInfo& info = sRelicInfo[sPendingRelicText];
+    std::string text = std::string("You got the %y") + info.name + "%w!&" + info.description;
+    CustomMessage msg = CustomMessage(text, text, text);
+    msg.AutoFormat();
+    msg.LoadIntoFont();
+    *loadFromMessageTable = false;
+    sPendingRelicText = RELIC_NONE;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -804,7 +925,7 @@ static s32 FindFreeTreasureFlag(PlayState* play);
 
 static bool TrySpawnRewardChest(PlayState* play) {
     // Randomizer files map chests to seed locations, so chests are kept out of runs started on them.
-    if (IS_RANDO || RandInt(1, 100) > ROGUELIKE_CHEST_CHANCE) {
+    if (IS_RANDO || RandInt(1, 100) > ROGUELIKE_CHEST_CHANCE + 15 * RelicCount(RELIC_LUCKY_CLOVER)) {
         return false;
     }
 
@@ -901,11 +1022,13 @@ static void OnItemReceiveRoguelike(GetItemEntry itemEntry) {
 // Pick 1 of 3: reward floors put down a row of big chests; opening one makes the others vanish.
 // ---------------------------------------------------------------------------------------------------------------------
 
-static constexpr int MAX_CHOICE_CHESTS = 3;
+static constexpr int MAX_CHOICE_CHESTS = 5;
 
 typedef struct {
     Actor* actor;
     s32 flag;
+    Relic relic; // RELIC_NONE for a normal item chest
+    bool devil;  // costs a heart container
 } ChoiceChest;
 
 static ChoiceChest sChoiceChests[MAX_CHOICE_CHESTS];
@@ -968,16 +1091,10 @@ static bool IsReachableFloorSpot(PlayState* play, Vec3f target, Vec3f* outPos) {
     return true;
 }
 
-static Actor* SpawnChest(PlayState* play, Vec3f pos, GetItemID item, bool big, s32 flag) {
-    Player* player = GET_PLAYER(play);
-    s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos); // open side faces Link
-    return Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
-                       (s16)ENBOX_PARAMS(big ? ENBOX_TYPE_BIG_DEFAULT : ENBOX_TYPE_SMALL, item, flag));
-}
-
-// Puts down up to three big chests with different major items. Returns false if there aren't at least two
-// different items to choose from, or nowhere to put them (the caller then hands out a direct reward instead).
-static bool SpawnRewardChoice(PlayState* play) {
+// Puts down a row of big chests to choose from: major items, relics, and sometimes a devil deal (an ornate chest
+// that holds a strong relic but costs a heart container). Returns false if there aren't at least two things to
+// offer, or nowhere to put them (the caller then hands out a direct reward instead).
+static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
     if (IS_RANDO) {
         return false;
     }
@@ -990,31 +1107,61 @@ static bool SpawnRewardChoice(PlayState* play) {
         }
     }
     std::shuffle(items.begin(), items.end(), sRng);
-    int count = std::min((int)items.size(), MAX_CHOICE_CHESTS);
+
+    typedef struct {
+        GetItemID item;
+        Relic relic;
+        bool devil;
+    } Offer;
+    std::vector<Offer> offers;
+    std::vector<Relic> offeredRelics;
+
+    int slots = 3 + (HasRelic(RELIC_LUCKY_CLOVER) ? 1 : 0);
+    for (int i = 0; i < slots; i++) {
+        bool wantRelic = ROGUELIKE_RELICS && ((guaranteeRelic && i == 0) || RandInt(1, 100) <= 35 || items.empty());
+        Relic relic = wantRelic ? PickRelic(false, offeredRelics) : RELIC_NONE;
+        if (relic != RELIC_NONE) {
+            offers.push_back({ GI_RUPEE_PURPLE, relic, false });
+            offeredRelics.push_back(relic);
+        } else if (!items.empty()) {
+            offers.push_back({ items.back(), RELIC_NONE, false });
+            items.pop_back();
+        }
+    }
+
+    // Devil deal: a strong relic for a heart container, if Link can spare one.
+    int devilChance = HasRelic(RELIC_CURSED_MASK) ? 40 : 20;
+    if (ROGUELIKE_RELICS && gSaveContext.healthCapacity >= 3 * 16 && RandInt(1, 100) <= devilChance) {
+        Relic relic = PickRelic(true, offeredRelics);
+        if (relic != RELIC_NONE) {
+            offers.push_back({ GI_RUPEE_PURPLE, relic, true });
+        }
+    }
+
+    int count = std::min((int)offers.size(), MAX_CHOICE_CHESTS);
     if (count < 2) {
         return false;
     }
 
-    // Lay them out in a row in front of Link.
+    // Lay them out in a row in front of Link, about 110 units apart.
     Player* player = GET_PLAYER(play);
     f32 fwdX = Math_SinS(player->actor.shape.rot.y);
     f32 fwdZ = Math_CosS(player->actor.shape.rot.y);
-    Vec3f center = { player->actor.world.pos.x + fwdX * 150.0f, player->actor.world.pos.y,
-                     player->actor.world.pos.z + fwdZ * 150.0f };
-    static const f32 sOffsets3[] = { -120.0f, 0.0f, 120.0f };
-    static const f32 sOffsets2[] = { -75.0f, 75.0f };
+    Vec3f center = { player->actor.world.pos.x + fwdX * 160.0f, player->actor.world.pos.y,
+                     player->actor.world.pos.z + fwdZ * 160.0f };
 
     std::vector<Vec3f> placed;
     sChoiceCount = 0;
+    bool anyDevil = false;
     for (int i = 0; i < count; i++) {
-        f32 offset = (count == 3) ? sOffsets3[i] : sOffsets2[i];
+        f32 offset = (i - (count - 1) / 2.0f) * 110.0f;
         Vec3f target = { center.x + fwdZ * offset, center.y, center.z - fwdX * offset };
         Vec3f pos;
         bool found = IsReachableFloorSpot(play, target, &pos);
 
         // Fall back to any clear spot that isn't on top of another chest.
         for (int attempt = 0; !found && attempt < 10; attempt++) {
-            if (FindFloorSpotNearPlayer(play, 110.0f, 260.0f, &pos)) {
+            if (FindFloorSpotNearPlayer(play, 110.0f, 280.0f, &pos)) {
                 found = true;
                 for (const Vec3f& other : placed) {
                     if (Math_Vec3f_DistXZ(&pos, (Vec3f*)&other) < 100.0f) {
@@ -1031,10 +1178,17 @@ static bool SpawnRewardChoice(PlayState* play) {
         if (flag == CHEST_NONE) {
             break;
         }
-        Actor* chest = SpawnChest(play, pos, items[i], true, flag);
+        const Offer& offer = offers[i];
+        Player* link = GET_PLAYER(play);
+        s16 yaw = Math_Vec3f_Yaw(&pos, &link->actor.world.pos);
+        // Devil deals use the ornate boss key chest so they stand out.
+        s16 type = offer.devil ? ENBOX_TYPE_DECORATED_BIG : ENBOX_TYPE_BIG_DEFAULT;
+        Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
+                                   (s16)ENBOX_PARAMS(type, offer.item, flag));
         if (chest != NULL) {
-            sChoiceChests[sChoiceCount++] = { chest, flag };
+            sChoiceChests[sChoiceCount++] = { chest, flag, offer.relic, offer.devil };
             placed.push_back(pos);
+            anyDevil = anyDevil || offer.devil;
         }
     }
 
@@ -1048,6 +1202,10 @@ static bool SpawnRewardChoice(PlayState* play) {
     }
 
     Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
+    if (anyDevil) {
+        Sfx_PlaySfxCentered(NA_SE_EN_GANON_LAUGH);
+        Notify("A devil deal appeared! ", "The ornate chest holds a strong relic - but costs a heart container.");
+    }
     return true;
 }
 
@@ -1074,6 +1232,17 @@ static bool UpdateRewardChoice(PlayState* play) {
     }
     for (int i = 0; i < sChoiceCount; i++) {
         if (Flags_GetTreasure(play, sChoiceChests[i].flag)) {
+            const ChoiceChest& picked = sChoiceChests[i];
+            if (picked.relic != RELIC_NONE) {
+                sPendingRelicText = picked.relic; // the chest's text box will name the relic
+                GrantRelic(play, picked.relic);
+            }
+            if (picked.devil) {
+                gSaveContext.healthCapacity = (s16)std::max(16, gSaveContext.healthCapacity - 16);
+                gSaveContext.health = std::min(gSaveContext.health, gSaveContext.healthCapacity);
+                Sfx_PlaySfxCentered(NA_SE_EN_GANON_LAUGH);
+                Notify("Devil deal: ", "-1 heart container.");
+            }
             RemoveChoiceChests(play, sChoiceChests[i].actor);
             play->actorCtx.flags.chest &= ~(1u << sChoiceChests[i].flag); // free it for later
             sChoiceCount = 0;
@@ -1385,6 +1554,8 @@ typedef struct {
     int level;
     EnemyAffix affix;
     u8 prevHealth;
+    int burnTicks; // Ember Edge: fire damage left to deal
+    int burnTimer;
 } EnemyInfo;
 
 static std::unordered_map<Actor*, EnemyInfo> sEnemies;
@@ -1462,6 +1633,8 @@ static void SetUpEnemy(Actor* actor) {
     EnemyInfo info;
     info.level = std::max(1, sRun.floor + RandInt(-1, 1));
     info.affix = AFFIX_NONE;
+    info.burnTicks = 0;
+    info.burnTimer = 0;
 
     int eliteChance = std::min(8 + sRun.floor * 4, 60);
     if (sRun.modifier == FLOORMOD_ELITE) {
@@ -1536,10 +1709,37 @@ static void OnActorUpdateRoguelike(void* refActor) {
     u8 health = actor->colChkInfo.health;
     if (health < info.prevHealth && health > 0) {
         int dealt = info.prevHealth - health;
-        int bonusPct = PlayerDamageBonusPct(sRun.level) + (sRun.modifier == FLOORMOD_GLASS_CANNON ? 100 : 0);
+        int bonusPct = PlayerDamageBonusPct(sRun.level) + (sRun.modifier == FLOORMOD_GLASS_CANNON ? 100 : 0) +
+                       25 * RelicCount(RELIC_GORON_FIST) + (HasRelic(RELIC_GLASS_SWORD) ? 100 : 0);
         int extra = (dealt * bonusPct + 50) / 100;
         if (extra > 0) {
             actor->colChkInfo.health = (u8)std::max(1, (int)health - extra);
+        }
+
+        // Ember Edge: set it on fire.
+        if (HasRelic(RELIC_EMBER_EDGE) && info.burnTicks == 0 &&
+            RandInt(1, 100) <= std::min(25 * RelicCount(RELIC_EMBER_EDGE), 75)) {
+            info.burnTicks = 4;
+            info.burnTimer = FRAMES_PER_SECOND;
+            Vec3f firePos = actor->world.pos;
+            EffectSsEnFire_SpawnVec3f(play, actor, &firePos, 70, 0, 0, -1);
+        }
+        // Frostbite: freeze it solid for a moment.
+        if (HasRelic(RELIC_FROSTBITE) && actor->freezeTimer == 0 &&
+            RandInt(1, 100) <= std::min(20 * RelicCount(RELIC_FROSTBITE), 60)) {
+            actor->freezeTimer = 40;
+            Actor_SetColorFilter(actor, 0, 255, 0, 40);
+            Sfx_PlaySfxCentered(NA_SE_EV_ICE_FREEZE);
+        }
+    }
+
+    // Burning: a point of damage each second. Like the level bonus, it never finishes an enemy off by itself.
+    if (info.burnTicks > 0 && --info.burnTimer <= 0) {
+        info.burnTicks--;
+        info.burnTimer = FRAMES_PER_SECOND;
+        if (actor->colChkInfo.health > 1) {
+            actor->colChkInfo.health--;
+            Actor_SetColorFilter(actor, 0x4000, 255, 0, 6);
         }
     }
     info.prevHealth = actor->colChkInfo.health;
@@ -1573,7 +1773,32 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     }
     int level = it->second.level;
     bool elite = it->second.affix != AFFIX_NONE;
+    Vec3f deathPos = ((Actor*)refActor)->world.pos;
     sEnemies.erase(it);
+
+    // Vampire Fang: heal on every kill.
+    if (HasRelic(RELIC_VAMPIRE_FANG)) {
+        ApplyOwnHealthChange(play, (s16)(4 * RelicCount(RELIC_VAMPIRE_FANG)));
+    }
+    // Bombchu Heart: the enemy blows up, hurting (and briefly stunning) others nearby.
+    if (HasRelic(RELIC_BOMBCHU_HEART)) {
+        Vec3f zero = { 0.0f, 0.0f, 0.0f };
+        Vec3f blastPos = deathPos;
+        blastPos.y += 20.0f;
+        EffectSsBomb2_SpawnLayered(play, &blastPos, &zero, &zero, 100, 19);
+        Sfx_PlaySfxCentered(NA_SE_IT_BOMB_EXPLOSION);
+        f32 radius = 120.0f + 40.0f * RelicCount(RELIC_BOMBCHU_HEART);
+        int damage = 2 * RelicCount(RELIC_BOMBCHU_HEART);
+        for (auto& [other, otherInfo] : sEnemies) {
+            if (other->update == NULL || other->colChkInfo.health == 0 ||
+                Math_Vec3f_DistXYZ(&other->world.pos, &deathPos) > radius) {
+                continue;
+            }
+            other->colChkInfo.health = (u8)std::max(1, (int)other->colChkInfo.health - damage);
+            otherInfo.prevHealth = other->colChkInfo.health;
+            Actor_SetColorFilter(other, 0x4000, 255, 0, 8);
+        }
+    }
 
     int xp = 10 + 5 * level;
     if (elite) {
@@ -1584,6 +1809,7 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     } else if (sRun.modifier == FLOORMOD_GIANT) {
         xp = xp * 3 / 2;
     }
+    xp = xp * (2 + RelicCount(RELIC_SCHOLARS_LENS)) / 2; // Scholar's Lens: +50 percent per stack
     GainXp(play, xp);
 }
 
@@ -1612,6 +1838,35 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
         return;
     }
     int taken = -amount;
+
+    // Deku Bark: sometimes the hit just bounces off.
+    if (HasRelic(RELIC_DEKU_BARK) && RandInt(1, 100) <= std::min(15 * RelicCount(RELIC_DEKU_BARK), 45)) {
+        gSaveContext.health = (s16)std::min(gSaveContext.health + taken, (int)gSaveContext.healthCapacity);
+        Sfx_PlaySfxCentered(NA_SE_IT_SHIELD_REFLECT_SW);
+        return;
+    }
+
+    // Thorn Mail: the closest enemy (most likely the attacker) gets hurt back.
+    if (HasRelic(RELIC_THORN_MAIL)) {
+        Player* player = GET_PLAYER(play);
+        Actor* closest = NULL;
+        f32 closestDist = 160.0f;
+        for (auto& [enemy, enemyInfo] : sEnemies) {
+            f32 dist = Actor_WorldDistXYZToActor(enemy, &player->actor);
+            if (enemy->update != NULL && enemy->colChkInfo.health > 1 && dist < closestDist) {
+                closest = enemy;
+                closestDist = dist;
+            }
+        }
+        if (closest != NULL) {
+            EnemyInfo& closestInfo = sEnemies[closest];
+            closest->colChkInfo.health =
+                (u8)std::max(1, (int)closest->colChkInfo.health - 2 * RelicCount(RELIC_THORN_MAIL));
+            closestInfo.prevHealth = closest->colChkInfo.health;
+            Actor_SetColorFilter(closest, 0x4000, 255, 0, 8);
+        }
+    }
+
     f32 scaled = taken * EnemyDamageMultiplier(sRun.floor) * (1.0f - PlayerDefensePct(sRun.level) / 100.0f);
     if (sRun.modifier == FLOORMOD_GLASS_CANNON) {
         scaled *= 2.0f;
@@ -1622,6 +1877,10 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
 
     if (sAffixCooldown == 0 && sPendingAffix == AFFIX_NONE) {
         EnemyAffix affix = FindAttackingAffix(play);
+        // Navi's Eye: elemental attacks often miss.
+        if (affix != AFFIX_NONE && HasRelic(RELIC_NAVIS_EYE) && RandInt(0, 1) == 0) {
+            affix = AFFIX_NONE;
+        }
         if (affix != AFFIX_NONE) {
             sPendingAffix = affix;
             sPendingAffixDelay = 8; // let the hit's own knockback play out first
@@ -1629,7 +1888,18 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
     }
 }
 
+static s8 sPrevArrows = -1;
+
 static void UpdateLeveling(PlayState* play) {
+    // Twin Arrows: refund fired arrows now and then.
+    s8 arrows = AMMO(ITEM_BOW);
+    if (HasRelic(RELIC_TWIN_ARROWS) && sPrevArrows >= 0 && arrows == sPrevArrows - 1 &&
+        RandInt(1, 100) <= (RelicCount(RELIC_TWIN_ARROWS) >= 2 ? 75 : 50)) {
+        AMMO(ITEM_BOW) = sPrevArrows;
+        arrows = sPrevArrows;
+    }
+    sPrevArrows = arrows;
+
     if (!sNewElites.empty()) {
         std::string names;
         for (size_t i = 0; i < sNewElites.size(); i++) {
@@ -1657,7 +1927,7 @@ static void UpdateLeveling(PlayState* play) {
                 GameInteractor::RawAction::ElectrocutePlayer();
                 break;
             case AFFIX_POISON:
-                sPoisonTicks = POISON_TICKS;
+                sPoisonTicks = HasRelic(RELIC_NAVIS_EYE) ? POISON_TICKS / 2 : POISON_TICKS;
                 sPoisonTimer = POISON_INTERVAL;
                 Notify("Poisoned!");
                 break;
@@ -1745,10 +2015,11 @@ static const char* sModifierDescriptions[FLOORMOD_MAX] = {
 };
 
 static FloorModifier RollFloorModifier(int floor) {
-    if (!ROGUELIKE_MODIFIERS || floor < 2) {
+    bool cursed = HasRelic(RELIC_CURSED_MASK);
+    if ((!ROGUELIKE_MODIFIERS && !cursed) || (floor < 2 && !cursed)) {
         return FLOORMOD_NONE;
     }
-    int chance = std::min(15 + floor * 3, 50);
+    int chance = cursed ? 100 : std::min(15 + floor * 3, 50);
     if (RandInt(1, 100) > chance) {
         return FLOORMOD_NONE;
     }
@@ -1997,6 +2268,9 @@ static void ResetRunState() {
     sRun.miniBoss = false;
     sRun.miniBossSet = 0;
     sLastBoss = -1;
+    memset(sRelics, 0, sizeof(sRelics));
+    sPendingRelicText = RELIC_NONE;
+    sPrevArrows = -1;
     sChoiceCount = 0;
     ResetLeveling();
 }
@@ -2125,7 +2399,10 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
         GainXp(play, 40 + 10 * sRun.floor);
     }
     if (sRun.arena || sRun.floor % every == 0) {
-        if (SpawnRewardChoice(play)) {
+        if (HasRelic(RELIC_CURSED_MASK)) {
+            GiveRandomReward(play); // the mask's richer rewards: a bonus on top of the choice
+        }
+        if (SpawnRewardChoice(play, false)) {
             Notify("Choose your reward! ", "Open one chest - the others will vanish.");
         } else {
             GiveRandomReward(play);
@@ -2166,7 +2443,7 @@ static void OnBossCleared(PlayState* play) {
 
     GainXp(play, 60 + 15 * sRun.floor);
 
-    if (SpawnRewardChoice(play)) {
+    if (SpawnRewardChoice(play, true)) {
         Notify("Choose your reward! ", "Open one chest - the others will vanish.");
     } else {
         GiveRandomReward(play);
@@ -2363,6 +2640,14 @@ static void OnPlayerHealthChangeRoguelike(int16_t amount) {
     if (HasBottledFairy()) {
         return;
     }
+    // Second Wind: spend a charge to survive with one heart.
+    if (HasRelic(RELIC_SECOND_WIND)) {
+        sRelics[RELIC_SECOND_WIND]--;
+        gSaveContext.health = 16;
+        Sfx_PlaySfxCentered(NA_SE_SY_GET_BOXITEM);
+        Notify("Second Wind! ", "You cling to life.");
+        return;
+    }
     // Permadeath: instead of the game over screen, end the run.
     gSaveContext.health = 1;
     Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
@@ -2433,6 +2718,34 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
         Interface_DrawTextLine(play->state.gfxCtx, (char*)twist.c_str(), 190, 210, 150, 210, 255, alpha, 0.65f, 1);
     }
 
+    // Top: the relics collected this run.
+    std::string relics;
+    int lineLength = 0;
+    for (int r = 0; r < RELIC_COUNT; r++) {
+        if (sRelics[r] == 0) {
+            continue;
+        }
+        std::string entry = sRelicInfo[r].shortName;
+        if (sRelics[r] > 1) {
+            entry += " x" + std::to_string(sRelics[r]);
+        }
+        if (relics.empty()) {
+            relics = "Relics: ";
+            lineLength = (int)relics.size();
+        } else if (lineLength + (int)entry.size() > 46) {
+            relics += ",\n";
+            lineLength = 0;
+        } else {
+            relics += ", ";
+            lineLength += 2;
+        }
+        relics += entry;
+        lineLength += (int)entry.size();
+    }
+    if (!relics.empty()) {
+        Interface_DrawTextLine(play->state.gfxCtx, (char*)relics.c_str(), 24, 10, 200, 160, 255, alpha, 0.6f, 1);
+    }
+
     // Left: level (gold). Right: floor (white).
     Interface_DrawTextLine(play->state.gfxCtx, (char*)levelText.c_str(), 40, 222, 255, 220, 100, alpha, 0.75f, 1);
     Interface_DrawTextLine(play->state.gfxCtx, (char*)floorText.c_str(), 190, 222, 255, 255, 255, alpha, 0.75f, 1);
@@ -2485,6 +2798,20 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(OnActorDestroy, true, OnActorDestroyRoguelike);
     COND_HOOK(OnEnemyDefeat, true, OnEnemyDefeatRoguelike);
     COND_HOOK(OnBossDefeat, true, OnBossDefeatRoguelike);
+    COND_ID_HOOK(OnOpenText, TEXT_PURPLE_RUPEE, true, BuildRelicMessage);
+
+    // Pegasus Feather: a faster ground run speed. Steps aside if another speed effect already took over this frame.
+    COND_VB_SHOULD(VB_PLAYER_MODIFY_RUN_SPEED, true, {
+        if (sRun.active && HasRelic(RELIC_PEGASUS_FEATHER) && *should) {
+            Player* player = va_arg(args, Player*);
+            f32* speedTarget = va_arg(args, f32*);
+            s16* yawTarget = va_arg(args, s16*);
+            *speedTarget *= 1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER);
+            func_8083DF68(player, *speedTarget, *yawTarget);
+            func_8083DDC8(player, gPlayState);
+            *should = false;
+        }
+    });
 
     // Boss floors: no blue warp out and no heart container drop; the run hands out its own rewards.
     COND_VB_SHOULD(VB_SPAWN_BLUE_WARP, true, {

@@ -1977,6 +1977,14 @@ void SohMenu::AddMenuEnhancements() {
             "From floor 3, some floors are survival arenas out in the world (Hyrule Field, Lon Lon Ranch, Sacred "
             "Forest Meadow, Lake Hylia, Desert Colossus, Kakariko Graveyard) with extra waves. Surviving always "
             "gives a reward. Leaving the area counts as fleeing: no reward."));
+    AddWidget(path, "Relics & Devil Deals", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Relics"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Reward chests can hold relics: passive, stackable powers for the run (Goron Fist, Ember Edge, "
+            "Frostbite, Bombchu Heart, Twin Arrows, Deku Bark, Thorn Mail, Vampire Fang, Second Wind, Pegasus "
+            "Feather, Lucky Clover, Scholar's Lens, Navi's Eye, Glass Sword, Cursed Mask). Sometimes an ornate "
+            "devil deal chest appears: a strong relic that costs a heart container. Collected relics are listed "
+            "at the top of the pause screen."));
     AddWidget(path, "Restart Run Automatically on Death", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.AutoRestart"))
         .Options(
