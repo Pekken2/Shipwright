@@ -297,6 +297,14 @@ s32 EffectBlure_Update(void* thisx) {
             break;
     }
 
+    // Roguelike Descent: a sword variation recolours sword trails.
+    if ((this->trailType == TRAIL_TYPE_KOKIRI_SWORD || this->trailType == TRAIL_TYPE_MASTER_SWORD ||
+         this->trailType == TRAIL_TYPE_BIGGORON_SWORD) &&
+        Roguelike_GetSwordTrailColor(&color)) {
+        changed = 1;
+        reset = 0;
+    }
+
     // We cant just straight up assign the colors because we need to preserve the alpha channel
     if (changed) {
         this->p1StartColor.r = color.r;

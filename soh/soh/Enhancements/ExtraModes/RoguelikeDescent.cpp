@@ -179,6 +179,7 @@ typedef enum {
     REWARD_HYLIAN_SHIELD,
     REWARD_MASK,  // a random mask other than the one Link carries
     REWARD_TUNIC, // a random run tunic other than the one Link wears
+    REWARD_BLADE, // a random sword variation other than the current one
     REWARD_MAX,
 } RoguelikeReward;
 
@@ -197,6 +198,18 @@ typedef enum {
     RTUNIC_SAGE,     // magic meter that refills by itself
     RTUNIC_COUNT,
 } RunTunic;
+
+// Sword variations: change the colour of the sword's swing trail and what Link's hits do. One at a time.
+typedef enum {
+    RBLADE_NONE,
+    RBLADE_FLAME,   // every hit sets the enemy on fire
+    RBLADE_FROST,   // hits often freeze
+    RBLADE_THUNDER, // every third hit shocks enemies around the target
+    RBLADE_BLOOD,   // hits heal Link a little
+    RBLADE_HEAVY,   // much more damage, a bit slower
+    RBLADE_DANCER,  // quick hits in a row build up damage
+    RBLADE_COUNT,
+} RunBlade;
 
 typedef enum {
     ROOM_STATE_ENTERING, // just landed, waiting to spawn the first wave
@@ -259,6 +272,7 @@ static struct {
     int miniBossSet;
     int kills; // enemies defeated this run
     RunTunic tunic;
+    RunBlade blade;
 } sRun;
 
 static std::vector<Actor*> sArenaEnemies; // on arena floors only the enemies we spawned have to be beaten
@@ -772,6 +786,41 @@ static void PutOnTunic(PlayState* play, RunTunic tunic) {
     }
 }
 
+typedef struct {
+    const char* name;
+    const char* ability;
+    Color_RGBA8 trail;
+} RunBladeInfo;
+
+static const RunBladeInfo sRunBlades[RBLADE_COUNT] = {
+    { "", "", { 255, 255, 255, 255 } },
+    { "Flame Blade", "Every hit sets the enemy on fire.", { 255, 110, 20, 255 } },
+    { "Frost Blade", "Hits often freeze enemies solid.", { 120, 210, 255, 255 } },
+    { "Thunder Blade", "Every third hit shocks enemies around the target.", { 255, 240, 60, 255 } },
+    { "Blood Blade", "Every hit heals you a little.", { 170, 0, 30, 255 } },
+    { "Heavy Blade", "Deal 60 percent more damage, but run a little slower.", { 150, 110, 70, 255 } },
+    { "Dancer's Blade", "Quick hits in a row deal more and more damage.", { 255, 120, 220, 255 } },
+};
+
+static bool HasBlade(RunBlade blade) {
+    return sRun.active && sRun.blade == blade;
+}
+
+static RunBlade PickNewBlade() {
+    std::vector<RunBlade> pool;
+    for (int b = RBLADE_NONE + 1; b < RBLADE_COUNT; b++) {
+        if (b != sRun.blade) {
+            pool.push_back((RunBlade)b);
+        }
+    }
+    return pool[RandInt(0, (int)pool.size() - 1)];
+}
+
+static int sThunderHits = 0;  // Thunder Blade: hits since the last shock
+static int sComboHits = 0;    // Dancer's Blade: hits in the current string
+static int sComboFrames = 0;  // frames since the last hit of the string
+static constexpr int COMBO_WINDOW = 2 * FRAMES_PER_SECOND;
+
 static bool IsRewardAvailable(RoguelikeReward reward) {
     const bool hasMagic = gSaveContext.isMagicAcquired;
     const bool hasBow = HasItem(ITEM_BOW);
@@ -821,6 +870,7 @@ static bool IsRewardAvailable(RoguelikeReward reward) {
                    !CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_MIRROR);
         case REWARD_MASK:
         case REWARD_TUNIC:
+        case REWARD_BLADE:
             return true;
         default:
             return false;
@@ -969,6 +1019,14 @@ static void GiveReward(PlayState* play, RoguelikeReward reward) {
             EquipNewMask(play, *mask);
             name = mask->name;
             icon = mask->item;
+            break;
+        }
+        case REWARD_BLADE: {
+            RunBlade blade = PickNewBlade();
+            sRun.blade = blade;
+            name = sRunBlades[blade].name;
+            icon = ITEM_SWORD_KOKIRI;
+            Notify(std::string(sRunBlades[blade].name) + " - ", sRunBlades[blade].ability);
             break;
         }
         case REWARD_TUNIC: {
@@ -1246,6 +1304,7 @@ typedef struct {
     Relic relic; // RELIC_NONE for a normal item chest
     bool devil;  // costs a heart container
     RunTunic tunic; // RTUNIC_NONE unless it holds a run tunic
+    RunBlade blade; // RBLADE_NONE unless it holds a sword variation
 } ChoiceChest;
 
 static ChoiceChest sChoiceChests[MAX_CHOICE_CHESTS];
@@ -1330,8 +1389,10 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         Relic relic;
         bool devil;
         RunTunic tunic;
+        RunBlade blade;
     } Offer;
     bool tunicOffered = false;
+    bool bladeOffered = false;
     std::vector<Offer> offers;
     std::vector<Relic> offeredRelics;
 
@@ -1340,14 +1401,18 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         bool wantRelic = ROGUELIKE_RELICS && ((guaranteeRelic && i == 0) || RandInt(1, 100) <= 35 || items.empty());
         Relic relic = wantRelic ? PickRelic(false, offeredRelics) : RELIC_NONE;
         if (relic != RELIC_NONE) {
-            offers.push_back({ GI_RUPEE_PURPLE, relic, false, RTUNIC_NONE });
+            offers.push_back({ GI_RUPEE_PURPLE, relic, false, RTUNIC_NONE, RBLADE_NONE });
             offeredRelics.push_back(relic);
         } else if (!tunicOffered && RandInt(1, 100) <= 25) {
             // A run tunic, shown as a relic-style chest. At most one per choice.
-            offers.push_back({ GI_RUPEE_PURPLE, RELIC_NONE, false, PickNewTunic() });
+            offers.push_back({ GI_RUPEE_PURPLE, RELIC_NONE, false, PickNewTunic(), RBLADE_NONE });
             tunicOffered = true;
+        } else if (!bladeOffered && RandInt(1, 100) <= 25) {
+            // A sword variation, also shown as a relic-style chest. At most one per choice.
+            offers.push_back({ GI_RUPEE_PURPLE, RELIC_NONE, false, RTUNIC_NONE, PickNewBlade() });
+            bladeOffered = true;
         } else if (!items.empty()) {
-            offers.push_back({ items.back(), RELIC_NONE, false, RTUNIC_NONE });
+            offers.push_back({ items.back(), RELIC_NONE, false, RTUNIC_NONE, RBLADE_NONE });
             items.pop_back();
         }
     }
@@ -1357,7 +1422,7 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
     if (ROGUELIKE_RELICS && gSaveContext.healthCapacity >= 3 * 16 && RandInt(1, 100) <= devilChance) {
         Relic relic = PickRelic(true, offeredRelics);
         if (relic != RELIC_NONE) {
-            offers.push_back({ GI_RUPEE_PURPLE, relic, true, RTUNIC_NONE });
+            offers.push_back({ GI_RUPEE_PURPLE, relic, true, RTUNIC_NONE, RBLADE_NONE });
         }
     }
 
@@ -1409,7 +1474,7 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
                                    (s16)ENBOX_PARAMS(type, offer.item, flag));
         if (chest != NULL) {
-            sChoiceChests[sChoiceCount++] = { chest, flag, offer.relic, offer.devil, offer.tunic };
+            sChoiceChests[sChoiceCount++] = { chest, flag, offer.relic, offer.devil, offer.tunic, offer.blade };
             placed.push_back(pos);
             anyDevil = anyDevil || offer.devil;
         }
@@ -1459,6 +1524,12 @@ static bool UpdateRewardChoice(PlayState* play) {
             if (picked.relic != RELIC_NONE) {
                 sPendingRelicText = picked.relic; // the chest's text box will name the relic
                 GrantRelic(play, picked.relic);
+            }
+            if (picked.blade != RBLADE_NONE) {
+                const RunBladeInfo& bladeInfo = sRunBlades[picked.blade];
+                sPendingChestText = std::string("You got the %y") + bladeInfo.name + "%w!&" + bladeInfo.ability;
+                sRun.blade = picked.blade;
+                Notify(std::string(bladeInfo.name) + " - ", bladeInfo.ability);
             }
             if (picked.tunic != RTUNIC_NONE) {
                 const RunTunicInfo& tunicInfo = sRunTunics[picked.tunic];
@@ -1955,8 +2026,14 @@ static void OnActorUpdateRoguelike(void* refActor) {
                        (HasRelic(RELIC_DINS_POWER) ? 75 : 0) +
                        (WearingTunic(RTUNIC_CRIMSON) && gSaveContext.health * 2 <= gSaveContext.healthCapacity ? 40
                                                                                                              : 0) -
-                       (WearingTunic(RTUNIC_GUARDIAN) ? 15 : 0) +
+                       (WearingTunic(RTUNIC_GUARDIAN) ? 15 : 0) + (HasBlade(RBLADE_HEAVY) ? 60 : 0) +
                        10 * std::min(sFuryKills, 5 * RelicCount(RELIC_BATTLE_FURY));
+        // Dancer's Blade: each hit soon after the last adds 8 percent, up to +80.
+        if (HasBlade(RBLADE_DANCER)) {
+            sComboHits = sComboFrames <= COMBO_WINDOW ? std::min(sComboHits + 1, 10) : 1;
+            sComboFrames = 0;
+            bonusPct += 8 * (sComboHits - 1);
+        }
         // Lucky Strike: now and then a hit lands for triple damage.
         if (HasRelic(RELIC_LUCKY_STRIKE) && RandInt(1, 100) <= 12 * RelicCount(RELIC_LUCKY_STRIKE)) {
             bonusPct += 200;
@@ -1968,6 +2045,38 @@ static void OnActorUpdateRoguelike(void* refActor) {
             actor->colChkInfo.health = (u8)std::max(1, (int)health - extra);
         }
 
+        // Flame Blade: every hit sets the enemy on fire.
+        if (HasBlade(RBLADE_FLAME) && info.burnTicks == 0) {
+            info.burnTicks = 4;
+            info.burnTimer = FRAMES_PER_SECOND;
+            Vec3f firePos = actor->world.pos;
+            EffectSsEnFire_SpawnVec3f(play, actor, &firePos, 70, 0, 0, -1);
+        }
+        // Frost Blade: a good chance to freeze.
+        if (HasBlade(RBLADE_FROST) && actor->freezeTimer == 0 && RandInt(1, 100) <= 35) {
+            actor->freezeTimer = 40;
+            Actor_SetColorFilter(actor, 0, 255, 0, 40);
+            Sfx_PlaySfxCentered(NA_SE_EV_ICE_FREEZE);
+        }
+        // Thunder Blade: every third hit shocks everything around the target.
+        if (HasBlade(RBLADE_THUNDER) && ++sThunderHits >= 3) {
+            sThunderHits = 0;
+            Sfx_PlaySfxCentered(NA_SE_EN_BIRI_SPARK);
+            Actor_SetColorFilter(actor, 0, 255, 0, 12);
+            for (auto& [other, otherInfo] : sEnemies) {
+                if (other == actor || other->update == NULL || other->colChkInfo.health <= 1 ||
+                    Math_Vec3f_DistXYZ(&other->world.pos, &actor->world.pos) > 180.0f) {
+                    continue;
+                }
+                other->colChkInfo.health = (u8)std::max(1, (int)other->colChkInfo.health - 3);
+                otherInfo.prevHealth = other->colChkInfo.health;
+                Actor_SetColorFilter(other, 0, 255, 0, 12);
+            }
+        }
+        // Blood Blade: every hit heals an eighth of a heart.
+        if (HasBlade(RBLADE_BLOOD)) {
+            ApplyOwnHealthChange(play, 2);
+        }
         // Ember Edge: set it on fire.
         if (HasRelic(RELIC_EMBER_EDGE) && info.burnTicks == 0 &&
             RandInt(1, 100) <= std::min(25 * RelicCount(RELIC_EMBER_EDGE), 75)) {
@@ -2229,6 +2338,11 @@ static void UpdateLeveling(PlayState* play) {
         }
     } else {
         sRegenFrames = 0;
+    }
+
+    // Dancer's Blade: the string breaks if Link stops hitting for a moment.
+    if (sComboFrames <= COMBO_WINDOW) {
+        sComboFrames++;
     }
 
     // Sage Tunic: a point of magic every half second.
@@ -2616,6 +2730,10 @@ static void ResetRunState() {
     sRun.miniBoss = false;
     sRun.miniBossSet = 0;
     sRun.tunic = RTUNIC_NONE;
+    sRun.blade = RBLADE_NONE;
+    sThunderHits = 0;
+    sComboHits = 0;
+    sComboFrames = COMBO_WINDOW + 1;
     sLastBoss = -1;
     memset(sRelics, 0, sizeof(sRelics));
     sPendingRelicText = RELIC_NONE;
@@ -3240,8 +3358,11 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     // Top: the mask being worn and the relics collected this run.
     std::string relics;
     int lineLength = 0;
+    if (sRun.blade != RBLADE_NONE) {
+        relics = sRunBlades[sRun.blade].name;
+    }
     if (sRun.tunic != RTUNIC_NONE) {
-        relics = sRunTunics[sRun.tunic].name;
+        relics += (relics.empty() ? "" : ", ") + std::string(sRunTunics[sRun.tunic].name);
     }
     for (const RoguelikeMask& mask : sMasks) {
         if (Wearing(mask.mask)) {
@@ -3299,6 +3420,15 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
 // so it counts as on while a run is active, without touching the player's own setting.
 extern "C" int Ship_EquipmentAlwaysVisible(void) {
     return CVarGetInteger(CVAR_ENHANCEMENT("EquipmentAlwaysVisible"), 0) || sRun.active;
+}
+
+// The sword trail colour of the current sword variation, if any (used by the swing trail effect).
+extern "C" int Roguelike_GetSwordTrailColor(Color_RGBA8* color) {
+    if (!sRun.active || sRun.blade == RBLADE_NONE) {
+        return 0;
+    }
+    *color = sRunBlades[sRun.blade].trail;
+    return 1;
 }
 
 extern "C" bool Roguelike_IsRunActive() {
@@ -3372,14 +3502,15 @@ static void RegisterRoguelikeDescent() {
     COND_VB_SHOULD(VB_PLAYER_MODIFY_RUN_SPEED, true, {
         if (sRun.active &&
             (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_BUNNY) || HasRelic(RELIC_STONE_SKIN) ||
-             WearingTunic(RTUNIC_SWIFT)) &&
+             WearingTunic(RTUNIC_SWIFT) || HasBlade(RBLADE_HEAVY)) &&
             *should) {
             Player* player = va_arg(args, Player*);
             f32* speedTarget = va_arg(args, f32*);
             s16* yawTarget = va_arg(args, s16*);
             *speedTarget *=
                 1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_BUNNY) ? 0.3f : 0.0f) -
-                0.1f * RelicCount(RELIC_STONE_SKIN) + (WearingTunic(RTUNIC_SWIFT) ? 0.15f : 0.0f);
+                0.1f * RelicCount(RELIC_STONE_SKIN) + (WearingTunic(RTUNIC_SWIFT) ? 0.15f : 0.0f) -
+                (HasBlade(RBLADE_HEAVY) ? 0.1f : 0.0f);
             func_8083DF68(player, *speedTarget, *yawTarget);
             func_8083DDC8(player, gPlayState);
             *should = false;
