@@ -177,13 +177,26 @@ typedef enum {
     REWARD_FAIRY_BOTTLE,
     REWARD_MASTER_SWORD,
     REWARD_HYLIAN_SHIELD,
-    REWARD_MASK, // a random mask other than the one Link carries
+    REWARD_MASK,  // a random mask other than the one Link carries
+    REWARD_TUNIC, // a random run tunic other than the one Link wears
     REWARD_MAX,
 } RoguelikeReward;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Run state
 // ---------------------------------------------------------------------------------------------------------------------
+
+// Run tunics: recolour Link's green tunic and give an ability. One at a time; a new one replaces the old.
+typedef enum {
+    RTUNIC_NONE,
+    RTUNIC_CRIMSON,  // more damage when low on health
+    RTUNIC_SHADOW,   // some hits pass through
+    RTUNIC_FORTUNE,  // kills can drop hearts
+    RTUNIC_SWIFT,    // run faster
+    RTUNIC_GUARDIAN, // take less damage, deal a bit less
+    RTUNIC_SAGE,     // magic meter that refills by itself
+    RTUNIC_COUNT,
+} RunTunic;
 
 typedef enum {
     ROOM_STATE_ENTERING, // just landed, waiting to spawn the first wave
@@ -245,6 +258,7 @@ static struct {
     bool miniBoss; // a boss floor where no boss could be beaten with Link's gear: tough enemies instead
     int miniBossSet;
     int kills; // enemies defeated this run
+    RunTunic tunic;
 } sRun;
 
 static std::vector<Actor*> sArenaEnemies; // on arena floors only the enemies we spawned have to be beaten
@@ -420,12 +434,18 @@ static void GrantRelic(PlayState* play, Relic relic) {
 }
 
 // Shows the relic's name and effect instead of the stand-in purple rupee's text when a relic chest is opened.
+static std::string sPendingChestText; // a tunic chest's text, set when it's opened
 static void BuildRelicMessage(uint16_t* textId, bool* loadFromMessageTable) {
-    if (!sRun.active || sPendingRelicText == RELIC_NONE) {
+    std::string text;
+    if (sRun.active && !sPendingChestText.empty()) {
+        text = sPendingChestText;
+        sPendingChestText.clear();
+    } else if (sRun.active && sPendingRelicText != RELIC_NONE) {
+        const RelicInfo& info = sRelicInfo[sPendingRelicText];
+        text = std::string("You got the %y") + info.name + "%w!&" + info.description;
+    } else {
         return;
     }
-    const RelicInfo& info = sRelicInfo[sPendingRelicText];
-    std::string text = std::string("You got the %y") + info.name + "%w!&" + info.description;
     CustomMessage msg = CustomMessage(text, text, text);
     msg.AutoFormat();
     msg.LoadIntoFont();
@@ -713,6 +733,45 @@ static void EquipNewMask(PlayState* play, const RoguelikeMask& mask) {
     Notify(std::string(mask.name) + " - ", mask.ability);
 }
 
+typedef struct {
+    const char* name;
+    const char* ability;
+    Color_RGB8 color;
+} RunTunicInfo;
+
+static const RunTunicInfo sRunTunics[RTUNIC_COUNT] = {
+    { "", "", { 30, 105, 27 } },
+    { "Crimson Tunic", "Fury: deal 40 percent more damage while at half health or less.", { 170, 20, 30 } },
+    { "Shadow Tunic", "Phantom: a fifth of enemy hits pass right through you.", { 45, 35, 70 } },
+    { "Fortune Tunic", "Bounty: enemies often drop a heart when they fall.", { 225, 180, 40 } },
+    { "Swift Tunic", "Gale: run 15 percent faster.", { 110, 215, 230 } },
+    { "Guardian Tunic", "Bulwark: take 25 percent less damage, deal 15 percent less.", { 125, 130, 145 } },
+    { "Sage Tunic", "Wisdom: a magic meter, and your magic slowly refills.", { 135, 60, 200 } },
+};
+
+static bool WearingTunic(RunTunic tunic) {
+    return sRun.active && sRun.tunic == tunic;
+}
+
+static RunTunic PickNewTunic() {
+    std::vector<RunTunic> pool;
+    for (int t = RTUNIC_NONE + 1; t < RTUNIC_COUNT; t++) {
+        if (t != sRun.tunic) {
+            pool.push_back((RunTunic)t);
+        }
+    }
+    return pool[RandInt(0, (int)pool.size() - 1)];
+}
+
+static void GiveMagic(PlayState* play, bool doubleMagic);
+
+static void PutOnTunic(PlayState* play, RunTunic tunic) {
+    sRun.tunic = tunic;
+    if (tunic == RTUNIC_SAGE && !gSaveContext.isMagicAcquired) {
+        GiveMagic(play, false);
+    }
+}
+
 static bool IsRewardAvailable(RoguelikeReward reward) {
     const bool hasMagic = gSaveContext.isMagicAcquired;
     const bool hasBow = HasItem(ITEM_BOW);
@@ -761,6 +820,7 @@ static bool IsRewardAvailable(RoguelikeReward reward) {
             return !CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_HYLIAN) &&
                    !CHECK_OWNED_EQUIP(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_MIRROR);
         case REWARD_MASK:
+        case REWARD_TUNIC:
             return true;
         default:
             return false;
@@ -909,6 +969,14 @@ static void GiveReward(PlayState* play, RoguelikeReward reward) {
             EquipNewMask(play, *mask);
             name = mask->name;
             icon = mask->item;
+            break;
+        }
+        case REWARD_TUNIC: {
+            RunTunic tunic = PickNewTunic();
+            PutOnTunic(play, tunic);
+            name = sRunTunics[tunic].name;
+            Notify(std::string(sRunTunics[tunic].name) + " - ", sRunTunics[tunic].ability);
+            icon = ITEM_TUNIC_KOKIRI;
             break;
         }
         default:
@@ -1177,6 +1245,7 @@ typedef struct {
     s32 flag;
     Relic relic; // RELIC_NONE for a normal item chest
     bool devil;  // costs a heart container
+    RunTunic tunic; // RTUNIC_NONE unless it holds a run tunic
 } ChoiceChest;
 
 static ChoiceChest sChoiceChests[MAX_CHOICE_CHESTS];
@@ -1260,7 +1329,9 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         GetItemID item;
         Relic relic;
         bool devil;
+        RunTunic tunic;
     } Offer;
+    bool tunicOffered = false;
     std::vector<Offer> offers;
     std::vector<Relic> offeredRelics;
 
@@ -1269,10 +1340,14 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         bool wantRelic = ROGUELIKE_RELICS && ((guaranteeRelic && i == 0) || RandInt(1, 100) <= 35 || items.empty());
         Relic relic = wantRelic ? PickRelic(false, offeredRelics) : RELIC_NONE;
         if (relic != RELIC_NONE) {
-            offers.push_back({ GI_RUPEE_PURPLE, relic, false });
+            offers.push_back({ GI_RUPEE_PURPLE, relic, false, RTUNIC_NONE });
             offeredRelics.push_back(relic);
+        } else if (!tunicOffered && RandInt(1, 100) <= 25) {
+            // A run tunic, shown as a relic-style chest. At most one per choice.
+            offers.push_back({ GI_RUPEE_PURPLE, RELIC_NONE, false, PickNewTunic() });
+            tunicOffered = true;
         } else if (!items.empty()) {
-            offers.push_back({ items.back(), RELIC_NONE, false });
+            offers.push_back({ items.back(), RELIC_NONE, false, RTUNIC_NONE });
             items.pop_back();
         }
     }
@@ -1282,7 +1357,7 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
     if (ROGUELIKE_RELICS && gSaveContext.healthCapacity >= 3 * 16 && RandInt(1, 100) <= devilChance) {
         Relic relic = PickRelic(true, offeredRelics);
         if (relic != RELIC_NONE) {
-            offers.push_back({ GI_RUPEE_PURPLE, relic, true });
+            offers.push_back({ GI_RUPEE_PURPLE, relic, true, RTUNIC_NONE });
         }
     }
 
@@ -1334,7 +1409,7 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
                                    (s16)ENBOX_PARAMS(type, offer.item, flag));
         if (chest != NULL) {
-            sChoiceChests[sChoiceCount++] = { chest, flag, offer.relic, offer.devil };
+            sChoiceChests[sChoiceCount++] = { chest, flag, offer.relic, offer.devil, offer.tunic };
             placed.push_back(pos);
             anyDevil = anyDevil || offer.devil;
         }
@@ -1384,6 +1459,12 @@ static bool UpdateRewardChoice(PlayState* play) {
             if (picked.relic != RELIC_NONE) {
                 sPendingRelicText = picked.relic; // the chest's text box will name the relic
                 GrantRelic(play, picked.relic);
+            }
+            if (picked.tunic != RTUNIC_NONE) {
+                const RunTunicInfo& tunicInfo = sRunTunics[picked.tunic];
+                sPendingChestText = std::string("You got the %y") + tunicInfo.name + "%w!&" + tunicInfo.ability;
+                PutOnTunic(play, picked.tunic);
+                Notify(std::string(tunicInfo.name) + " - ", tunicInfo.ability);
             }
             if (picked.devil) {
                 gSaveContext.healthCapacity = (s16)std::max(16, gSaveContext.healthCapacity - 16);
@@ -1872,6 +1953,9 @@ static void OnActorUpdateRoguelike(void* refActor) {
                        (Wearing(PLAYER_MASK_SKULL) ? 50 : 0) +
                        (Wearing(PLAYER_MASK_TRUTH) && info.affix != AFFIX_NONE ? 50 : 0) +
                        (HasRelic(RELIC_DINS_POWER) ? 75 : 0) +
+                       (WearingTunic(RTUNIC_CRIMSON) && gSaveContext.health * 2 <= gSaveContext.healthCapacity ? 40
+                                                                                                             : 0) -
+                       (WearingTunic(RTUNIC_GUARDIAN) ? 15 : 0) +
                        10 * std::min(sFuryKills, 5 * RelicCount(RELIC_BATTLE_FURY));
         // Lucky Strike: now and then a hit lands for triple damage.
         if (HasRelic(RELIC_LUCKY_STRIKE) && RandInt(1, 100) <= 12 * RelicCount(RELIC_LUCKY_STRIKE)) {
@@ -1945,6 +2029,11 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     sEnemies.erase(it);
     sRun.kills++;
     sFuryKills++;
+
+    // Fortune Tunic: a heart now and then.
+    if (WearingTunic(RTUNIC_FORTUNE) && RandInt(1, 100) <= 35) {
+        Item_DropCollectible(play, &deathPos, ITEM00_HEART);
+    }
 
     // Spirit Chain: a bolt jumps to the nearest enemy still standing.
     if (HasRelic(RELIC_SPIRIT_CHAIN)) {
@@ -2043,6 +2132,13 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
         return;
     }
 
+    // Shadow Tunic: a fifth of hits pass right through.
+    if (WearingTunic(RTUNIC_SHADOW) && RandInt(1, 100) <= 20) {
+        gSaveContext.health = (s16)std::min(gSaveContext.health + taken, (int)gSaveContext.healthCapacity);
+        Sfx_PlaySfxCentered(NA_SE_EN_FANTOM_LAUGH);
+        return;
+    }
+
     // Deku Bark: sometimes the hit just bounces off.
     if (HasRelic(RELIC_DEKU_BARK) && RandInt(1, 100) <= std::min(15 * RelicCount(RELIC_DEKU_BARK), 45)) {
         gSaveContext.health = (s16)std::min(gSaveContext.health + taken, (int)gSaveContext.healthCapacity);
@@ -2082,6 +2178,9 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
         scaled *= 0.8f;
     }
     scaled *= 1.0f - 0.15f * RelicCount(RELIC_STONE_SKIN);
+    if (WearingTunic(RTUNIC_GUARDIAN)) {
+        scaled *= 0.75f;
+    }
     if (HasRelic(RELIC_DINS_POWER)) {
         scaled *= 1.5f;
     }
@@ -2130,6 +2229,12 @@ static void UpdateLeveling(PlayState* play) {
         }
     } else {
         sRegenFrames = 0;
+    }
+
+    // Sage Tunic: a point of magic every half second.
+    if (WearingTunic(RTUNIC_SAGE) && gSaveContext.isMagicAcquired && gSaveContext.magicState == MAGIC_STATE_IDLE &&
+        gSaveContext.magic < gSaveContext.magicCapacity && sRun.roomFrames % (FRAMES_PER_SECOND / 2) == 0) {
+        gSaveContext.magic++;
     }
 
     // Blast Pouch: a bomb every 8 seconds (4 with two), up to the bag's size.
@@ -2510,6 +2615,7 @@ static void ResetRunState() {
     sRun.fled = false;
     sRun.miniBoss = false;
     sRun.miniBossSet = 0;
+    sRun.tunic = RTUNIC_NONE;
     sLastBoss = -1;
     memset(sRelics, 0, sizeof(sRelics));
     sPendingRelicText = RELIC_NONE;
@@ -3134,12 +3240,15 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     // Top: the mask being worn and the relics collected this run.
     std::string relics;
     int lineLength = 0;
+    if (sRun.tunic != RTUNIC_NONE) {
+        relics = sRunTunics[sRun.tunic].name;
+    }
     for (const RoguelikeMask& mask : sMasks) {
         if (Wearing(mask.mask)) {
-            relics = std::string("Mask: ") + mask.name;
-            lineLength = (int)relics.size();
+            relics += (relics.empty() ? "" : ", ") + std::string("Mask: ") + mask.name;
         }
     }
+    lineLength = (int)relics.size();
     for (int r = 0; r < RELIC_COUNT; r++) {
         if (sRelics[r] == 0) {
             continue;
@@ -3261,16 +3370,31 @@ static void RegisterRoguelikeDescent() {
 
     // Pegasus Feather: a faster ground run speed. Steps aside if another speed effect already took over this frame.
     COND_VB_SHOULD(VB_PLAYER_MODIFY_RUN_SPEED, true, {
-        if (sRun.active && (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_BUNNY) || HasRelic(RELIC_STONE_SKIN)) &&
+        if (sRun.active &&
+            (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_BUNNY) || HasRelic(RELIC_STONE_SKIN) ||
+             WearingTunic(RTUNIC_SWIFT)) &&
             *should) {
             Player* player = va_arg(args, Player*);
             f32* speedTarget = va_arg(args, f32*);
             s16* yawTarget = va_arg(args, s16*);
             *speedTarget *=
                 1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_BUNNY) ? 0.3f : 0.0f) -
-                0.1f * RelicCount(RELIC_STONE_SKIN);
+                0.1f * RelicCount(RELIC_STONE_SKIN) + (WearingTunic(RTUNIC_SWIFT) ? 0.15f : 0.0f);
             func_8083DF68(player, *speedTarget, *yawTarget);
             func_8083DDC8(player, gPlayState);
+            *should = false;
+        }
+    });
+
+    // Run tunics recolour the Kokiri tunic. Drawn here rather than by changing the colour the game passes in, which
+    // points at the game's shared colour table (and the player's cosmetics settings stay untouched).
+    COND_VB_SHOULD(VB_APPLY_TUNIC_COLOR, true, {
+        if (sRun.active && sRun.tunic != RTUNIC_NONE && gPlayState != NULL &&
+            CUR_EQUIP_VALUE(EQUIP_TYPE_TUNIC) == EQUIP_VALUE_TUNIC_KOKIRI) {
+            const Color_RGB8& c = sRunTunics[sRun.tunic].color;
+            OPEN_DISPS(gPlayState->state.gfxCtx);
+            gDPSetEnvColor(POLY_OPA_DISP++, c.r, c.g, c.b, 0);
+            CLOSE_DISPS(gPlayState->state.gfxCtx);
             *should = false;
         }
     });
