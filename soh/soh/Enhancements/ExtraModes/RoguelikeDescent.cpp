@@ -68,6 +68,8 @@ void func_8083DDC8(Player* player, PlayState* play);
 #define ROGUELIKE_ROOM_REMIX CVarGetInteger(CVAR_ROGUELIKE("RoomRemix"), 1)
 #define ROGUELIKE_ARENAS CVarGetInteger(CVAR_ROGUELIKE("Arenas"), 1)
 #define ROGUELIKE_RELICS CVarGetInteger(CVAR_ROGUELIKE("Relics"), 1)
+#define ROGUELIKE_RANDOM_DUNGEON_CHESTS CVarGetInteger(CVAR_ROGUELIKE("RandomDungeonChests"), 1)
+#define ROGUELIKE_SWORD_BEAM CVarGetInteger(CVAR_ROGUELIKE("SwordBeam"), 1)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -1182,6 +1184,7 @@ static bool FindFloorSpotNearPlayer(PlayState* play, f32 minRadius, f32 maxRadiu
 
 // Maybe drops a treasure chest after a room is cleared. Returns true if one appeared.
 static s32 FindFreeTreasureFlag(PlayState* play);
+static u32 sOwnChestFlags = 0; // treasure flags of the chests the run put down in this room
 
 static bool TrySpawnRewardChest(PlayState* play) {
     // Randomizer files map chests to seed locations, so chests are kept out of runs started on them.
@@ -1206,6 +1209,7 @@ static bool TrySpawnRewardChest(PlayState* play) {
     Player* player = GET_PLAYER(play);
     s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos); // open side faces Link
 
+    sOwnChestFlags |= 1u << flag;
     Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
                                (s16)ENBOX_PARAMS(isMajor ? ENBOX_TYPE_BIG_DEFAULT : ENBOX_TYPE_SMALL, item, flag));
     if (chest == NULL) {
@@ -1472,6 +1476,7 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         s16 yaw = Math_Vec3f_Yaw(&pos, &link->actor.world.pos);
         // Devil deals use the ornate boss key chest so they stand out.
         s16 type = offer.devil ? ENBOX_TYPE_DECORATED_BIG : ENBOX_TYPE_BIG_DEFAULT;
+        sOwnChestFlags |= 1u << flag;
         Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
                                    (s16)ENBOX_PARAMS(type, offer.item, flag));
         if (chest != NULL) {
@@ -3038,6 +3043,161 @@ static void OnBossCleared(PlayState* play) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Dungeon chests: the chests a dungeon already has get random run loot instead of their usual contents
+// ---------------------------------------------------------------------------------------------------------------------
+
+extern "C" GetItemEntry ItemTable_RetrieveEntry(s16 tableID, s16 getItemID);
+
+static bool IsSmallChestType(s32 type) {
+    return type == ENBOX_TYPE_SMALL || type == ENBOX_TYPE_6 || type == ENBOX_TYPE_ROOM_CLEAR_SMALL ||
+           type == ENBOX_TYPE_SWITCH_FLAG_FALL_SMALL;
+}
+
+static void OnChestInitRoguelike(void* actorPtr) {
+    EnBox* box = (EnBox*)actorPtr;
+    PlayState* play = gPlayState;
+    if (!sRun.active || !ROGUELIKE_RANDOM_DUNGEON_CHESTS || IS_RANDO || play == NULL) {
+        return;
+    }
+    s16 params = box->dyna.actor.params;
+    s32 flag = params & 0x1F;
+    if ((sOwnChestFlags >> flag) & 1 || Flags_GetTreasure(play, flag)) {
+        return; // one of the run's own chests, or already open
+    }
+
+    // Big chests get a major item when one is left; small ones take whatever comes up.
+    bool wantMajor = !IsSmallChestType((params >> 12) & 0xF);
+    bool isMajor = false;
+    GetItemID item = PickChestItem(&isMajor);
+    for (int attempt = 0; wantMajor && !isMajor && attempt < 6; attempt++) {
+        item = PickChestItem(&isMajor);
+    }
+
+    box->dyna.actor.params = (s16)((params & ~(0x7F << 5)) | ((item & 0x7F) << 5));
+    box->getItemEntry = ItemTable_RetrieveEntry(MOD_NONE, item); // decides the chest's look with matching contents
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Sword beam: at full health, a sword swing also fires a beam (one on screen at a time)
+// ---------------------------------------------------------------------------------------------------------------------
+
+static ColliderCylinderInit sBeamColliderInit = {
+    { COLTYPE_NONE, AT_ON | AT_TYPE_PLAYER, AC_NONE, OC1_NONE, OC2_NONE, COLSHAPE_CYLINDER },
+    { ELEMTYPE_UNK2, { DMG_SLASH_MASTER, 0x00, 0x02 }, { 0x00000000, 0x00, 0x00 }, TOUCH_ON | TOUCH_SFX_NORMAL,
+      BUMP_NONE, OCELEM_NONE },
+    { 18, 30, -15, { 0, 0, 0 } },
+};
+
+static ColliderCylinder sBeamCollider;
+static Actor* sBeamColliderOwner = NULL; // the collider belongs to Link; set up again whenever Link is a new actor
+static bool sBeamActive = false;
+static Vec3f sBeamPos;
+static Vec3f sBeamVel;
+static int sBeamLife = 0;
+static s8 sPrevMeleeState = 0;
+static constexpr f32 BEAM_SPEED = 24.0f;
+static constexpr int BEAM_LIFE = 22;
+
+static void EndSwordBeam(PlayState* play, bool burst) {
+    if (sBeamActive && burst) {
+        Vec3f zero = { 0.0f, 0.0f, 0.0f };
+        Color_RGBA8 prim = { 255, 255, 255, 255 };
+        Color_RGBA8 env = { 120, 200, 255, 255 };
+        for (int i = 0; i < 6; i++) {
+            Vec3f vel = { RandFloat(-3.0f, 3.0f), RandFloat(-1.0f, 3.0f), RandFloat(-3.0f, 3.0f) };
+            EffectSsKiraKira_SpawnDispersed(play, &sBeamPos, &vel, &zero, &prim, &env, 2000, 8);
+        }
+    }
+    sBeamActive = false;
+}
+
+static void ResetSwordBeam() {
+    sBeamActive = false;
+    sBeamColliderOwner = NULL;
+    sPrevMeleeState = 0;
+}
+
+static bool HoldingSword(Player* player) {
+    return player->heldItemAction == PLAYER_IA_SWORD_MASTER || player->heldItemAction == PLAYER_IA_SWORD_KOKIRI ||
+           player->heldItemAction == PLAYER_IA_SWORD_BIGGORON;
+}
+
+static void UpdateSwordBeam(PlayState* play) {
+    Player* player = GET_PLAYER(play);
+    if (player == NULL) {
+        return;
+    }
+    if (sBeamColliderOwner != &player->actor) {
+        Collider_InitCylinder(play, &sBeamCollider);
+        Collider_SetCylinder(play, &sBeamCollider, &player->actor, &sBeamColliderInit);
+        sBeamColliderOwner = &player->actor;
+        sBeamActive = false;
+    }
+
+    // A new swing starts when the sword's attack state switches on.
+    s8 meleeState = player->meleeWeaponState;
+    bool swingStarted = meleeState != 0 && sPrevMeleeState == 0;
+    sPrevMeleeState = meleeState;
+
+    if (swingStarted && !sBeamActive && ROGUELIKE_SWORD_BEAM && HoldingSword(player) &&
+        gSaveContext.health >= gSaveContext.healthCapacity && gSaveContext.health > 0) {
+        s16 yaw = player->actor.shape.rot.y;
+        f32 fwdX = Math_SinS(yaw);
+        f32 fwdZ = Math_CosS(yaw);
+        sBeamPos = { player->actor.world.pos.x + fwdX * 30.0f, player->actor.world.pos.y + 35.0f,
+                     player->actor.world.pos.z + fwdZ * 30.0f };
+        sBeamVel = { fwdX * BEAM_SPEED, 0.0f, fwdZ * BEAM_SPEED };
+        sBeamLife = BEAM_LIFE;
+        sBeamActive = true;
+        sBeamCollider.base.atFlags &= ~AT_HIT;
+        Sfx_PlaySfxCentered(NA_SE_IT_SWORD_SWING_HARD);
+    }
+
+    if (!sBeamActive) {
+        return;
+    }
+
+    // Hit something last frame: it's spent.
+    if (sBeamCollider.base.atFlags & AT_HIT) {
+        sBeamCollider.base.atFlags &= ~AT_HIT;
+        EndSwordBeam(play, true);
+        return;
+    }
+    if (--sBeamLife <= 0) {
+        EndSwordBeam(play, true);
+        return;
+    }
+
+    // Move, stopping at walls.
+    Vec3f next = { sBeamPos.x + sBeamVel.x, sBeamPos.y + sBeamVel.y, sBeamPos.z + sBeamVel.z };
+    Vec3f wallHit;
+    CollisionPoly* wallPoly = NULL;
+    s32 bgId;
+    if (BgCheck_EntityLineTest1(&play->colCtx, &sBeamPos, &next, &wallHit, &wallPoly, true, false, false, true,
+                                &bgId)) {
+        sBeamPos = wallHit;
+        EndSwordBeam(play, true);
+        return;
+    }
+    sBeamPos = next;
+
+    // The beam itself: a bright streak of sparkles.
+    Vec3f zero = { 0.0f, 0.0f, 0.0f };
+    Color_RGBA8 prim = { 255, 255, 255, 255 };
+    Color_RGBA8 env = { 100, 180, 255, 255 };
+    for (int i = 0; i < 3; i++) {
+        Vec3f sparkPos = { sBeamPos.x - sBeamVel.x * (i / 3.0f), sBeamPos.y, sBeamPos.z - sBeamVel.z * (i / 3.0f) };
+        EffectSsKiraKira_SpawnDispersed(play, &sparkPos, &zero, &zero, &prim, &env, 2500, 5);
+    }
+
+    // Damage whatever it touches, the same way a sword swing would.
+    sBeamCollider.dim.pos.x = (s16)sBeamPos.x;
+    sBeamCollider.dim.pos.y = (s16)sBeamPos.y;
+    sBeamCollider.dim.pos.z = (s16)sBeamPos.z;
+    CollisionCheck_SetAT(play, &play->colChkCtx, &sBeamCollider.base);
+}
+
 static void OnPlayerUpdateRoguelike() {
     PlayState* play = gPlayState;
     if (play == NULL) {
@@ -3087,6 +3247,7 @@ static void OnPlayerUpdateRoguelike() {
     sRun.roomFrames++;
     sRun.stateFrames++;
     UpdateLeveling(play);
+    UpdateSwordBeam(play);
 
     switch (sRun.roomState) {
         case ROOM_STATE_ENTERING:
@@ -3214,6 +3375,8 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sRemixApplied = false;
     sHurtThisRoom = false;
     sFuryKills = 0;
+    sOwnChestFlags = 0;
+    ResetSwordBeam();
     ResetStallCheck();
     sBossAmmoCooldown = 0;
     if (sRun.arena) {
@@ -3485,6 +3648,7 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(AfterSceneCommands, true, PickRoomForPendingScene);
     COND_HOOK(OnPlayerHealthChange, true, OnPlayerHealthChangeRoguelike);
     COND_HOOK(OnLoadGame, true, OnLoadGameRoguelike);
+    COND_ID_HOOK(OnActorInit, ACTOR_EN_BOX, true, OnChestInitRoguelike);
     COND_HOOK(OnGameFrameUpdate, true, OnGameFrameUpdateRoguelike);
     COND_HOOK(OnItemReceive, true, OnItemReceiveRoguelike);
 

@@ -1977,6 +1977,16 @@ void SohMenu::AddMenuEnhancements() {
             "From floor 3, some floors are survival arenas out in the world (Hyrule Field, Lon Lon Ranch, Sacred "
             "Forest Meadow, Lake Hylia, Desert Colossus, Kakariko Graveyard) with extra waves. Surviving always "
             "gives a reward. Leaving the area counts as fleeing: no reward."));
+    AddWidget(path, "Random Dungeon Chests", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.RandomDungeonChests"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "The chests a dungeon already has (keys, maps, items) hold random run loot instead: big chests get a "
+            "major item when one is left, small ones get hearts or ammo."));
+    AddWidget(path, "Sword Beam at Full Health", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.SwordBeam"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "While your hearts are full, every sword swing also fires a beam that flies forward and hits the first "
+            "enemy in its path, like the original Legend of Zelda. One beam at a time; walls stop it."));
     AddWidget(path, "Relics & Devil Deals", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.Relics"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
