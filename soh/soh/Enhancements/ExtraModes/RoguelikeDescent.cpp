@@ -3417,13 +3417,13 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     Interface_DrawTextLine(play->state.gfxCtx, (char*)floorText.c_str(), 190, 222, 255, 255, 255, alpha, 0.75f, 1);
 }
 
-// Sets the run tunic's colour for Link's next draw. Kept outside the hook's lambda (and with C linkage, like the
-// pause screen drawing) so the display list macros link the same way they do elsewhere.
+// Sets the run tunic's colour for Link's next draw.
 extern "C" void Roguelike_SetTunicEnvColor(PlayState* play) {
     const Color_RGB8& c = sRunTunics[sRun.tunic].color;
-    OPEN_DISPS(play->state.gfxCtx);
-    gDPSetEnvColor(POLY_OPA_DISP++, c.r, c.g, c.b, 0);
-    CLOSE_DISPS(play->state.gfxCtx);
+    // Written straight into the opaque display list (what POLY_OPA_DISP points at) without OPEN_DISPS, which would
+    // add frame interpolation bookkeeping that a single colour command doesn't need.
+    GraphicsContext* gfxCtx = play->state.gfxCtx;
+    gDPSetEnvColor(gfxCtx->polyOpa.p++, c.r, c.g, c.b, 0);
 }
 
 // "Equipment Always Visible" draws child gear (Kokiri Sword, Deku Shield) properly on adult Link. Runs need that,
