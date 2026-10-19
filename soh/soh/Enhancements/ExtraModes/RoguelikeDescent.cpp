@@ -306,6 +306,16 @@ typedef enum {
     RELIC_NAVIS_EYE,       // elemental attacks often miss
     RELIC_GLASS_SWORD,     // double damage, half hearts
     RELIC_CURSED_MASK,     // every floor twisted, richer rewards
+    RELIC_LUCKY_STRIKE,    // chance for triple-damage hits
+    RELIC_BLAST_POUCH,     // a bomb bag, and bombs slowly come back
+    RELIC_FAIRY_BLESSING,  // slowly regain health
+    RELIC_STONE_SKIN,      // take less damage, run a bit slower
+    RELIC_DINS_POWER,      // much more damage dealt, more taken
+    RELIC_BATTLE_FURY,     // kills without getting hit build up damage
+    RELIC_FLAWLESS_CHARM,  // clear a room unhurt: +1 heart container
+    RELIC_SPIRIT_CHAIN,    // kills zap the nearest enemy
+    RELIC_SANDS_OF_TIME,   // more time on the room timer
+    RELIC_LON_LON_MILK,    // heal after every cleared room
     RELIC_COUNT,
 } Relic;
 
@@ -334,9 +344,23 @@ static const RelicInfo sRelicInfo[RELIC_COUNT] = {
     { "Navi's Eye", "Navi", "Elemental attacks often miss you.", 1, false },
     { "Glass Sword", "Glass", "Double damage, but your heart containers are halved.", 1, true },
     { "Cursed Mask", "Curse", "Every floor is twisted, but rewards are richer.", 1, true },
+    { "Lucky Strike", "Strike", "Some of your hits deal triple damage.", 3, true },
+    { "Blast Pouch", "Blast", "Get a bomb bag. Your bombs slowly come back.", 2, false },
+    { "Fairy's Blessing", "Fairy", "Slowly regain health over time.", 2, false },
+    { "Stone Skin", "Stone", "Take 15 percent less damage, but run a little slower.", 2, false },
+    { "Din's Power", "Din", "Deal 75 percent more damage, but take 50 percent more.", 1, true },
+    { "Battle Fury", "Fury", "Each kill without getting hit adds 10 percent damage.", 2, false },
+    { "Flawless Charm", "Flawless", "Clear a room without getting hurt to gain a heart container.", 1, true },
+    { "Spirit Chain", "Chain", "Every kill zaps the nearest enemy.", 3, false },
+    { "Sands of Time", "Sands", "30 more seconds on the room timer.", 2, false },
+    { "Lon Lon Milk", "Milk", "Heal a heart after every cleared room.", 2, false },
 };
 
 static int sRelics[RELIC_COUNT];
+static bool sHurtThisRoom = false; // Flawless Charm
+static int sFuryKills = 0;         // Battle Fury: kills since Link was last hurt
+static int sRegenFrames = 0;       // Fairy's Blessing
+static int sBombRegenFrames = 0;   // Blast Pouch
 static Relic sPendingRelicText = RELIC_NONE; // relic whose get-item text box is about to open
 
 static int RelicCount(Relic relic) {
@@ -367,11 +391,19 @@ static Relic PickRelic(bool devilDeal, const std::vector<Relic>& exclude) {
     return pool[dist(sRng)];
 }
 
+static bool HasItem(u8 item);
+static void AssignToFreeCButton(PlayState* play, u8 item);
+
 static void GrantRelic(PlayState* play, Relic relic) {
     if (relic == RELIC_NONE) {
         return;
     }
     sRelics[relic]++;
+
+    if (relic == RELIC_BLAST_POUCH && !HasItem(ITEM_BOMB)) {
+        Item_Give(play, ITEM_BOMB_BAG_20);
+        AssignToFreeCButton(play, ITEM_BOMB);
+    }
 
     if (relic == RELIC_GLASS_SWORD) {
         // Half the heart containers (at least one), rounded down to whole hearts.
@@ -1838,7 +1870,15 @@ static void OnActorUpdateRoguelike(void* refActor) {
         int bonusPct = PlayerDamageBonusPct(sRun.level) + (sRun.modifier == FLOORMOD_GLASS_CANNON ? 100 : 0) +
                        25 * RelicCount(RELIC_GORON_FIST) + (HasRelic(RELIC_GLASS_SWORD) ? 100 : 0) +
                        (Wearing(PLAYER_MASK_SKULL) ? 50 : 0) +
-                       (Wearing(PLAYER_MASK_TRUTH) && info.affix != AFFIX_NONE ? 50 : 0);
+                       (Wearing(PLAYER_MASK_TRUTH) && info.affix != AFFIX_NONE ? 50 : 0) +
+                       (HasRelic(RELIC_DINS_POWER) ? 75 : 0) +
+                       10 * std::min(sFuryKills, 5 * RelicCount(RELIC_BATTLE_FURY));
+        // Lucky Strike: now and then a hit lands for triple damage.
+        if (HasRelic(RELIC_LUCKY_STRIKE) && RandInt(1, 100) <= 12 * RelicCount(RELIC_LUCKY_STRIKE)) {
+            bonusPct += 200;
+            Sfx_PlaySfxCentered(NA_SE_IT_HAMMER_HIT);
+            Actor_SetColorFilter(actor, 0x4000, 255, 0, 10);
+        }
         int extra = (dealt * bonusPct + 50) / 100;
         if (extra > 0) {
             actor->colChkInfo.health = (u8)std::max(1, (int)health - extra);
@@ -1904,6 +1944,28 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     Vec3f deathPos = ((Actor*)refActor)->world.pos;
     sEnemies.erase(it);
     sRun.kills++;
+    sFuryKills++;
+
+    // Spirit Chain: a bolt jumps to the nearest enemy still standing.
+    if (HasRelic(RELIC_SPIRIT_CHAIN)) {
+        Actor* target = NULL;
+        f32 targetDist = 400.0f;
+        for (auto& [other, otherInfo] : sEnemies) {
+            f32 dist = Math_Vec3f_DistXYZ(&other->world.pos, &deathPos);
+            if (other->update != NULL && other->colChkInfo.health > 1 && dist < targetDist) {
+                target = other;
+                targetDist = dist;
+            }
+        }
+        if (target != NULL) {
+            EnemyInfo& targetInfo = sEnemies[target];
+            target->colChkInfo.health =
+                (u8)std::max(1, (int)target->colChkInfo.health - 3 * RelicCount(RELIC_SPIRIT_CHAIN));
+            targetInfo.prevHealth = target->colChkInfo.health;
+            Actor_SetColorFilter(target, 0, 255, 0, 12);
+            Sfx_PlaySfxCentered(NA_SE_EN_BIRI_SPARK);
+        }
+    }
 
     // Vampire Fang: heal on every kill.
     if (HasRelic(RELIC_VAMPIRE_FANG)) {
@@ -2019,6 +2081,12 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
     if (Wearing(PLAYER_MASK_GORON)) {
         scaled *= 0.8f;
     }
+    scaled *= 1.0f - 0.15f * RelicCount(RELIC_STONE_SKIN);
+    if (HasRelic(RELIC_DINS_POWER)) {
+        scaled *= 1.5f;
+    }
+    sHurtThisRoom = true;
+    sFuryKills = 0;
     int finalDamage = std::max(1, (int)lroundf(scaled));
     int delta = finalDamage - taken; // positive: extra damage, negative: damage refunded
     gSaveContext.health = (s16)std::clamp(gSaveContext.health - delta, -1, (int)gSaveContext.healthCapacity);
@@ -2052,6 +2120,27 @@ static void UpdateLeveling(PlayState* play) {
         arrows = sPrevArrows;
     }
     sPrevArrows = arrows;
+
+    // Fairy's Blessing: a quarter heart every 12 seconds (6 with two).
+    if (HasRelic(RELIC_FAIRY_BLESSING) && gSaveContext.health > 0 &&
+        gSaveContext.health < gSaveContext.healthCapacity && sRun.roomState != ROOM_STATE_RUN_OVER) {
+        if (++sRegenFrames >= 12 * FRAMES_PER_SECOND / RelicCount(RELIC_FAIRY_BLESSING)) {
+            sRegenFrames = 0;
+            ApplyOwnHealthChange(play, 4);
+        }
+    } else {
+        sRegenFrames = 0;
+    }
+
+    // Blast Pouch: a bomb every 8 seconds (4 with two), up to the bag's size.
+    if (HasRelic(RELIC_BLAST_POUCH) && HasItem(ITEM_BOMB) && AMMO(ITEM_BOMB) < CUR_CAPACITY(UPG_BOMB_BAG)) {
+        if (++sBombRegenFrames >= 8 * FRAMES_PER_SECOND / RelicCount(RELIC_BLAST_POUCH)) {
+            sBombRegenFrames = 0;
+            AMMO(ITEM_BOMB)++;
+        }
+    } else {
+        sBombRegenFrames = 0;
+    }
 
     if (!sNewElites.empty()) {
         std::string names;
@@ -2658,6 +2747,14 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
     if (Wearing(PLAYER_MASK_KEATON)) {
         ApplyOwnHealthChange(play, 16); // Keaton Mask: a heart back
     }
+    if (HasRelic(RELIC_LON_LON_MILK)) {
+        ApplyOwnHealthChange(play, (s16)(16 * RelicCount(RELIC_LON_LON_MILK)));
+    }
+    if (HasRelic(RELIC_FLAWLESS_CHARM) && !sHurtThisRoom && gSaveContext.healthCapacity < 20 * 16) {
+        gSaveContext.healthCapacity += 16;
+        ApplyOwnHealthChange(play, 16);
+        Notify("Flawless! ", "+1 heart container.");
+    }
 
     int every = std::max(1, ROGUELIKE_REWARD_EVERY);
     if (sRun.arena) {
@@ -2816,6 +2913,9 @@ static void OnPlayerUpdateRoguelike() {
             if (sRun.modifier == FLOORMOD_HASTY) {
                 limit = 45;
             }
+            if (limit > 0) {
+                limit += 30 * RelicCount(RELIC_SANDS_OF_TIME);
+            }
             if (limit > 0 && sRun.roomFrames >= limit * FRAMES_PER_SECOND) {
                 OnRoomCleared(play, true);
             }
@@ -2887,6 +2987,8 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sMiniBossActors.clear();
     sRemixHazards.clear();
     sRemixApplied = false;
+    sHurtThisRoom = false;
+    sFuryKills = 0;
     ResetStallCheck();
     sBossAmmoCooldown = 0;
     if (sRun.arena) {
@@ -3159,12 +3261,14 @@ static void RegisterRoguelikeDescent() {
 
     // Pegasus Feather: a faster ground run speed. Steps aside if another speed effect already took over this frame.
     COND_VB_SHOULD(VB_PLAYER_MODIFY_RUN_SPEED, true, {
-        if (sRun.active && (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_BUNNY)) && *should) {
+        if (sRun.active && (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_BUNNY) || HasRelic(RELIC_STONE_SKIN)) &&
+            *should) {
             Player* player = va_arg(args, Player*);
             f32* speedTarget = va_arg(args, f32*);
             s16* yawTarget = va_arg(args, s16*);
             *speedTarget *=
-                1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_BUNNY) ? 0.3f : 0.0f);
+                1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_BUNNY) ? 0.3f : 0.0f) -
+                0.1f * RelicCount(RELIC_STONE_SKIN);
             func_8083DF68(player, *speedTarget, *yawTarget);
             func_8083DDC8(player, gPlayState);
             *should = false;
