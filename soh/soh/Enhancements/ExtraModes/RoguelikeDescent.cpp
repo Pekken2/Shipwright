@@ -41,6 +41,7 @@
 #include "soh/Notification/Notification.h"
 #include "soh/SohGui/ImGuiUtils.h"
 #include "soh/ShipInit.hpp"
+#include "soh/frame_interpolation.h"
 
 extern "C" {
 #include "z64.h"
@@ -3416,6 +3417,15 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     Interface_DrawTextLine(play->state.gfxCtx, (char*)floorText.c_str(), 190, 222, 255, 255, 255, alpha, 0.75f, 1);
 }
 
+// Sets the run tunic's colour for Link's next draw. Kept outside the hook's lambda (and with C linkage, like the
+// pause screen drawing) so the display list macros link the same way they do elsewhere.
+extern "C" void Roguelike_SetTunicEnvColor(PlayState* play) {
+    const Color_RGB8& c = sRunTunics[sRun.tunic].color;
+    OPEN_DISPS(play->state.gfxCtx);
+    gDPSetEnvColor(POLY_OPA_DISP++, c.r, c.g, c.b, 0);
+    CLOSE_DISPS(play->state.gfxCtx);
+}
+
 // "Equipment Always Visible" draws child gear (Kokiri Sword, Deku Shield) properly on adult Link. Runs need that,
 // so it counts as on while a run is active, without touching the player's own setting.
 extern "C" int Ship_EquipmentAlwaysVisible(void) {
@@ -3466,6 +3476,8 @@ int Roguelike_GetXp() {
 int Roguelike_GetXpForNextLevel() {
     return XpForNextLevel(std::max(1, sRun.level));
 }
+
+extern "C" void Roguelike_SetTunicEnvColor(PlayState* play);
 
 static void RegisterRoguelikeDescent() {
     COND_HOOK(OnPlayerUpdate, true, OnPlayerUpdateRoguelike);
@@ -3522,10 +3534,7 @@ static void RegisterRoguelikeDescent() {
     COND_VB_SHOULD(VB_APPLY_TUNIC_COLOR, true, {
         if (sRun.active && sRun.tunic != RTUNIC_NONE && gPlayState != NULL &&
             CUR_EQUIP_VALUE(EQUIP_TYPE_TUNIC) == EQUIP_VALUE_TUNIC_KOKIRI) {
-            const Color_RGB8& c = sRunTunics[sRun.tunic].color;
-            OPEN_DISPS(gPlayState->state.gfxCtx);
-            gDPSetEnvColor(POLY_OPA_DISP++, c.r, c.g, c.b, 0);
-            CLOSE_DISPS(gPlayState->state.gfxCtx);
+            Roguelike_SetTunicEnvColor(gPlayState);
             *should = false;
         }
     });
