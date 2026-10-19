@@ -244,6 +244,7 @@ static struct {
     bool fled;
     bool miniBoss; // a boss floor where no boss could be beaten with Link's gear: tough enemies instead
     int miniBossSet;
+    int kills; // enemies defeated this run
 } sRun;
 
 static std::vector<Actor*> sArenaEnemies; // on arena floors only the enemies we spawned have to be beaten
@@ -1714,6 +1715,7 @@ static f32 EnemyDamageMultiplier(int floor) {
 static void ResetLeveling() {
     sRun.level = 1;
     sRun.xp = 0;
+    sRun.kills = 0;
     sEnemies.clear();
     sNewElites.clear();
     sPendingAffix = AFFIX_NONE;
@@ -1899,6 +1901,7 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     bool elite = it->second.affix != AFFIX_NONE;
     Vec3f deathPos = ((Actor*)refActor)->world.pos;
     sEnemies.erase(it);
+    sRun.kills++;
 
     // Vampire Fang: heal on every kill.
     if (HasRelic(RELIC_VAMPIRE_FANG)) {
@@ -2838,7 +2841,8 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
         levelText += "  (max)";
     }
     std::string floorText = "Floor " + std::to_string(sRun.floor) + "  Best " +
-                            std::to_string(std::max(sRun.floor, CVarGetInteger(ROGUELIKE_BEST_FLOOR_CVAR, 0)));
+                            std::to_string(std::max(sRun.floor, CVarGetInteger(ROGUELIKE_BEST_FLOOR_CVAR, 0))) +
+                            "  Kills " + std::to_string(sRun.kills);
 
     u8 alpha = (u8)std::min<u16>(play->pauseCtx.alpha, 255);
 
