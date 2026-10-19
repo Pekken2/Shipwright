@@ -255,6 +255,8 @@ static ReturnPoint sReturnPoint;
 // Requests coming from the menu (which runs outside of the game update) are handled on the next player update.
 static bool sStartRequested = false;
 static bool sAbandonRequested = false;
+static int sEndRunHoldFrames = 0; // how long the end-run button has been held on the pause screen
+#define END_RUN_HOLD_FRAMES (3 * 20)
 
 // Set while we are steering a scene load so the respawn data points at our chosen room.
 static bool sPendingRoomPick = false;
@@ -2827,6 +2829,34 @@ static void OnLoadGameRoguelike(int32_t fileNum) {
 // Public API (used by the menu and by Autosave)
 // ---------------------------------------------------------------------------------------------------------------------
 
+// The pause screen button that ends the run when held: L, or Z when L is set to turn pages (GameCube layout).
+static u16 EndRunButton() {
+    return CVarGetInteger(CVAR_ENHANCEMENT("NGCKaleidoSwitcher"), 0) ? BTN_Z : BTN_L;
+}
+
+static bool OnMainPauseScreen(PlayState* play) {
+    return play != NULL && play->pauseCtx.state == 6 && play->pauseCtx.debugState == 0;
+}
+
+// Escape hatch for soft locks: holding the button on the pause screen ends the run once the game is unpaused.
+static void OnGameFrameUpdateRoguelike() {
+    PlayState* play = gPlayState;
+    if (!sRun.active || sAbandonRequested || !OnMainPauseScreen(play)) {
+        sEndRunHoldFrames = 0;
+        return;
+    }
+    if (CHECK_BTN_ALL(play->state.input[0].cur.button, EndRunButton())) {
+        sEndRunHoldFrames++;
+        if (sEndRunHoldFrames >= END_RUN_HOLD_FRAMES) {
+            sAbandonRequested = true;
+            sEndRunHoldFrames = 0;
+            Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
+        }
+    } else {
+        sEndRunHoldFrames = 0;
+    }
+}
+
 // Shows Link's level/XP and the floor along the bottom of the pause screen while a run is active.
 extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     // Only on the main pause screen (not while it opens/closes or on the save prompt).
@@ -2909,6 +2939,22 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
         Interface_DrawTextLine(play->state.gfxCtx, (char*)relics.c_str(), 24, 10, 200, 160, 255, alpha, 0.6f, 1);
     }
 
+    // Above the bottom line: how to end the run (soft-lock escape), with a countdown while the button is held.
+    const char* buttonName = EndRunButton() == BTN_Z ? "Z" : "L";
+    std::string endText;
+    u8 endR = 170, endG = 170, endB = 170;
+    if (sAbandonRequested) {
+        endText = "Run will end when you unpause";
+        endR = 255; endG = 120; endB = 120;
+    } else if (sEndRunHoldFrames > 0) {
+        int secondsLeft = (END_RUN_HOLD_FRAMES - sEndRunHoldFrames + 19) / 20;
+        endText = std::string("Ending run in ") + std::to_string(secondsLeft) + "...";
+        endR = 255; endG = 160; endB = 80;
+    } else {
+        endText = std::string("Hold ") + buttonName + " to end run";
+    }
+    Interface_DrawTextLine(play->state.gfxCtx, (char*)endText.c_str(), 40, 210, endR, endG, endB, alpha, 0.6f, 1);
+
     // Left: level (gold). Right: floor (white).
     Interface_DrawTextLine(play->state.gfxCtx, (char*)levelText.c_str(), 40, 222, 255, 220, 100, alpha, 0.75f, 1);
     Interface_DrawTextLine(play->state.gfxCtx, (char*)floorText.c_str(), 190, 222, 255, 255, 255, alpha, 0.75f, 1);
@@ -2962,6 +3008,7 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(AfterSceneCommands, true, PickRoomForPendingScene);
     COND_HOOK(OnPlayerHealthChange, true, OnPlayerHealthChangeRoguelike);
     COND_HOOK(OnLoadGame, true, OnLoadGameRoguelike);
+    COND_HOOK(OnGameFrameUpdate, true, OnGameFrameUpdateRoguelike);
     COND_HOOK(OnItemReceive, true, OnItemReceiveRoguelike);
 
     // Masks stay on during runs: they don't come off when the mask leaves the C buttons, and they're put back on
