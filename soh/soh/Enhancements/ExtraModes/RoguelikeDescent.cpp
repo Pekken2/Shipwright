@@ -2533,6 +2533,114 @@ static void EnterRoomState(RoomState state) {
     sRun.stateFrames = 0;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Soft-lock protection
+// ---------------------------------------------------------------------------------------------------------------------
+
+// Enemies a room shouldn't wait for: ones that can't be beaten with Link's current gear, ones that only take part in
+// a puzzle, and ones that hide until Link does something. Native dungeon enemies are the usual culprits.
+static bool EnemyNeedsMissingGear(Actor* actor) {
+    switch (actor->id) {
+        case ACTOR_EN_VM: // Beamos: only bombs destroy them
+            return !((HasItem(ITEM_BOMB) && AMMO(ITEM_BOMB) > 0) || (HasItem(ITEM_BOMBCHU) && AMMO(ITEM_BOMBCHU) > 0));
+        case ACTOR_EN_ANUBICE: // Anubis: only fire hurts them
+            return !HasItem(ITEM_DINS_FIRE) && !HasItem(ITEM_ARROW_FIRE);
+        case ACTOR_EN_BA: // Jabu-Jabu's parasitic tentacles: boomerang only
+            return !HasItem(ITEM_BOOMERANG);
+        case ACTOR_EN_BX:         // Jabu-Jabu's electrified tentacles: can't be destroyed
+        case ACTOR_EN_HINTNUTS:   // the Deku Tree's riddle scrubs: wrong order and they come back
+        case ACTOR_EN_PO_SISTERS: // the Forest Temple's Poe sisters: part of a puzzle
+        case ACTOR_EN_WALLMAS:    // Wallmasters hide on the ceiling until Link stands still
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Enemies the room gave up on (unreachable or stuck); they no longer hold the room open.
+static std::vector<Actor*> sIgnoredEnemies;
+static int sStallFrames = 0; // frames since the last enemy was hurt or defeated
+static int sStallLastCount = -1;
+static s32 sStallLastHealth = -1;
+static constexpr int STALL_LIMIT = 30 * FRAMES_PER_SECOND;
+static constexpr int STALL_MAX_STRAGGLERS = 3; // only a few leftovers are given up on, never a whole wave
+
+static bool IsIgnoredEnemy(Actor* actor) {
+    return std::find(sIgnoredEnemies.begin(), sIgnoredEnemies.end(), actor) != sIgnoredEnemies.end();
+}
+
+// The enemies Link has to beat for the room to count as cleared, and their combined health.
+static int CountBlockingEnemies(PlayState* play, s32* totalHealth) {
+    int count = 0;
+    s32 health = 0;
+    for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; actor != NULL; actor = actor->next) {
+        if (EnemyNeedsMissingGear(actor) || IsIgnoredEnemy(actor)) {
+            continue;
+        }
+        count++;
+        health += actor->colChkInfo.health;
+    }
+    if (totalHealth != NULL) {
+        *totalHealth = health;
+    }
+    return count;
+}
+
+// Watches for a fight that's stopped going anywhere: the last few enemies haven't been hurt in a long while (stuck in
+// a wall, out of reach, ...). Returns true when they should be given up on.
+static bool UpdateStallCheck(PlayState* play, int count, s32 health) {
+    bool progress = count < sStallLastCount || health < sStallLastHealth;
+    sStallLastCount = count;
+    sStallLastHealth = health;
+    if (progress || count == 0 || count > STALL_MAX_STRAGGLERS) {
+        sStallFrames = 0;
+        return false;
+    }
+    sStallFrames++;
+    if (sStallFrames < STALL_LIMIT) {
+        return false;
+    }
+    sStallFrames = 0;
+    for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; actor != NULL; actor = actor->next) {
+        if (!IsIgnoredEnemy(actor)) {
+            sIgnoredEnemies.push_back(actor);
+        }
+    }
+    return true;
+}
+
+static void ResetStallCheck() {
+    sIgnoredEnemies.clear();
+    sStallFrames = 0;
+    sStallLastCount = -1;
+    sStallLastHealth = -1;
+}
+
+// Boss floors have no timer, so running dry on the boss's key ammo would end the run in a stalemate. A few bombs or
+// arrows turn up whenever Link runs out.
+static int sBossAmmoCooldown = 0;
+static void KeepBossAmmoStocked() {
+    if (sLastBoss < 0 || sRun.miniBoss) {
+        return;
+    }
+    if (sBossAmmoCooldown > 0) {
+        sBossAmmoCooldown--;
+        return;
+    }
+    bool (*needs)() = sBosses[sLastBoss].canFight;
+    if (needs == BossNeedsBombs && HasItem(ITEM_BOMB) && AMMO(ITEM_BOMB) == 0) {
+        AMMO(ITEM_BOMB) = 5;
+        Notify("Out of bombs! ", "A few more turn up.");
+    } else if (needs == BossNeedsBow && HasItem(ITEM_BOW) && AMMO(ITEM_BOW) == 0) {
+        AMMO(ITEM_BOW) = 10;
+        Notify("Out of arrows! ", "A few more turn up.");
+    } else {
+        return;
+    }
+    Sfx_PlaySfxCentered(NA_SE_SY_GET_ITEM);
+    sBossAmmoCooldown = 5 * FRAMES_PER_SECOND;
+}
+
 static void OnRoomCleared(PlayState* play, bool timedOut) {
     EnterRoomState(ROOM_STATE_CLEARED);
     SaveBestFloor(sRun.floor);
@@ -2677,7 +2785,18 @@ static void OnPlayerUpdateRoguelike() {
                 break;
             }
             // In arenas only our waves count; the open world is full of enemies that wander far away.
-            bool roomEmpty = sRun.arena ? sArenaEnemies.empty() : play->actorCtx.actorLists[ACTORCAT_ENEMY].length == 0;
+            bool roomEmpty;
+            if (sRun.arena) {
+                roomEmpty = sArenaEnemies.empty();
+            } else {
+                s32 health = 0;
+                int count = CountBlockingEnemies(play, &health);
+                roomEmpty = count == 0;
+                if (!roomEmpty && UpdateStallCheck(play, count, health)) {
+                    Notify("The last enemies are out of reach. ", "Moving on.");
+                    roomEmpty = true;
+                }
+            }
             if (roomEmpty) {
                 if (sRun.wavesLeft > 0) {
                     sRun.wavesLeft--;
@@ -2704,6 +2823,9 @@ static void OnPlayerUpdateRoguelike() {
         }
 
         case ROOM_STATE_BOSS:
+            if (!sRun.bossDefeated) {
+                KeepBossAmmoStocked();
+            }
             if (sRun.bossDefeated) {
                 sRun.bossWaitFrames++;
                 if (sRun.bossWaitFrames >= 2 * FRAMES_PER_SECOND && play->msgCtx.msgMode == MSGMODE_NONE &&
@@ -2765,6 +2887,8 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sMiniBossActors.clear();
     sRemixHazards.clear();
     sRemixApplied = false;
+    ResetStallCheck();
+    sBossAmmoCooldown = 0;
     if (sRun.arena) {
         sRun.wavesLeft = WavesForFloor(sRun.floor) + 2;
     }
