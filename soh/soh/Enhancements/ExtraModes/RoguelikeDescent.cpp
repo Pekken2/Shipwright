@@ -2679,10 +2679,7 @@ static void TriggerTransition(PlayState* play, s32 entrance) {
 // Picks the next floor's dungeon and sets everything up for the room drop. Returns the entrance to load.
 static s32 PrepareNextFloor() {
     sRun.floor++;
-
-    // Wear the right tunic for the heat / water.
-    GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_GORON);
-    GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_ZORA);
+    // Tunics are earned during the run (see WearTunicFor and the hot room check), never handed out per floor.
 
     sRun.miniBoss = false;
     if (IsBossFloor(sRun.floor)) {
