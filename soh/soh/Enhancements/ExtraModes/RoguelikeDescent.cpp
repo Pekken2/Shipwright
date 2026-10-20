@@ -176,6 +176,8 @@ typedef enum {
     REWARD_MIRROR_SHIELD,
     REWARD_BIGGORON_SWORD,
     REWARD_HOVER_BOOTS,
+    REWARD_GORON_TUNIC, // unlocks Fire Temple floors and Volvagia
+    REWARD_ZORA_TUNIC,
     REWARD_DOUBLE_DEFENSE,
     REWARD_FAIRY_BOTTLE,
     REWARD_MASTER_SWORD,
@@ -864,6 +866,10 @@ static bool IsRewardAvailable(RoguelikeReward reward) {
             return !CHECK_OWNED_EQUIP(EQUIP_TYPE_SWORD, EQUIP_INV_SWORD_BIGGORON);
         case REWARD_HOVER_BOOTS:
             return !CHECK_OWNED_EQUIP(EQUIP_TYPE_BOOTS, EQUIP_INV_BOOTS_HOVER);
+        case REWARD_GORON_TUNIC:
+            return !CHECK_OWNED_EQUIP(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_GORON);
+        case REWARD_ZORA_TUNIC:
+            return !CHECK_OWNED_EQUIP(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_ZORA);
         case REWARD_DOUBLE_DEFENSE:
             return !gSaveContext.isDoubleDefenseAcquired;
         case REWARD_FAIRY_BOTTLE:
@@ -986,6 +992,16 @@ static void GiveReward(PlayState* play, RoguelikeReward reward) {
             Item_Give(play, ITEM_BOOTS_HOVER);
             name = "Hover Boots (equip from the pause menu)";
             icon = ITEM_BOOTS_HOVER;
+            break;
+        case REWARD_GORON_TUNIC:
+            Item_Give(play, ITEM_TUNIC_GORON);
+            name = "Goron Tunic (Fire Temple floors open up)";
+            icon = ITEM_TUNIC_GORON;
+            break;
+        case REWARD_ZORA_TUNIC:
+            Item_Give(play, ITEM_TUNIC_ZORA);
+            name = "Zora Tunic";
+            icon = ITEM_TUNIC_ZORA;
             break;
         case REWARD_DOUBLE_DEFENSE:
             gSaveContext.isDoubleDefenseAcquired = true;
@@ -1121,6 +1137,10 @@ static GetItemID RewardToGetItem(RoguelikeReward reward) {
             return GI_SWORD_BGS;
         case REWARD_HOVER_BOOTS:
             return GI_BOOTS_HOVER;
+        case REWARD_GORON_TUNIC:
+            return GI_TUNIC_GORON;
+        case REWARD_ZORA_TUNIC:
+            return GI_TUNIC_ZORA;
         default:
             return GI_NONE;
     }
@@ -2435,8 +2455,29 @@ typedef struct {
     bool (*canFight)(); // adult Link needs certain gear to be able to win
 } RoguelikeBoss;
 
+static bool OwnsGoronTunic() {
+    return CHECK_OWNED_EQUIP(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_GORON);
+}
+
+static bool OwnsTunic(u8 equipValue) {
+    switch (equipValue) {
+        case EQUIP_VALUE_TUNIC_GORON:
+            return OwnsGoronTunic();
+        case EQUIP_VALUE_TUNIC_ZORA:
+            return CHECK_OWNED_EQUIP(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_ZORA);
+        default:
+            return true;
+    }
+}
+
+// The tunic a floor calls for, if Link has it; otherwise the Kokiri Tunic.
+static void WearTunicFor(u8 equipValue) {
+    SetEquipValue(EQUIP_TYPE_TUNIC, OwnsTunic(equipValue) ? equipValue : EQUIP_VALUE_TUNIC_KOKIRI);
+}
+
 static bool BossNeedsHammer() {
-    return HasItem(ITEM_HAMMER); // Volvagia has to be knocked out of the lava with the hammer
+    // Volvagia has to be knocked out of the lava with the hammer, and its room is too hot without the Goron Tunic.
+    return HasItem(ITEM_HAMMER) && OwnsGoronTunic();
 }
 static bool BossNeedsBow() {
     return HasItem(ITEM_BOW);
@@ -2538,7 +2579,7 @@ static s32 PrepareBossFloor() {
     // Make sure the boss is there even if it was beaten before (in the real save or earlier this run).
     memset(&gSaveContext.sceneFlags[boss.sceneNum], 0, sizeof(SavedSceneFlags));
 
-    SetEquipValue(EQUIP_TYPE_TUNIC, boss.tunic);
+    WearTunicFor(boss.tunic);
     sPendingRoomPick = false;
     sRun.bossFloor = true;
     sRun.bossDefeated = false;
@@ -2637,10 +2678,18 @@ static s32 PrepareNextFloor() {
     sRun.arena = false;
 
     int unlocked = std::min((int)ARRAY_COUNT(sDungeons), 4 + ((sRun.floor - 1) / 3) * 2);
-    int dungeon = RandInt(0, unlocked - 1);
+    std::vector<int> pool;
+    for (int i = 0; i < unlocked; i++) {
+        // Hot dungeons need the Goron Tunic.
+        if (sDungeons[i].tunic == EQUIP_VALUE_TUNIC_GORON && !OwnsGoronTunic()) {
+            continue;
+        }
+        pool.push_back(i);
+    }
+    int dungeon = pool[RandInt(0, (int)pool.size() - 1)];
     const RoguelikeDungeon& d = sDungeons[dungeon];
 
-    SetEquipValue(EQUIP_TYPE_TUNIC, d.tunic);
+    WearTunicFor(d.tunic);
 
     sPendingRoomPick = true;
     sPendingScene = d.sceneNum;
@@ -3255,6 +3304,20 @@ static void OnPlayerUpdateRoguelike() {
 
     if (play->transitionTrigger != TRANS_TRIGGER_OFF || play->transitionMode != TRANS_MODE_OFF) {
         return;
+    }
+
+    // Landed in a hot room: put on the Goron Tunic if Link has it, otherwise move on before the heat gets him.
+    if (play->roomCtx.curRoom.behaviorType2 == ROOM_BEHAVIOR_TYPE2_3 &&
+        CUR_EQUIP_VALUE(EQUIP_TYPE_TUNIC) != EQUIP_VALUE_TUNIC_GORON && sRun.roomState != ROOM_STATE_RUN_OVER) {
+        if (OwnsGoronTunic()) {
+            SetEquipValue(EQUIP_TYPE_TUNIC, EQUIP_VALUE_TUNIC_GORON);
+            Player_SetEquipmentData(play, GET_PLAYER(play));
+            Notify("It's hot in here! ", "You put on the Goron Tunic.");
+        } else {
+            Notify("Too hot without a Goron Tunic! ", "Moving on.");
+            GoToNextFloor(play);
+            return;
+        }
     }
 
     if (sRun.fled) {
