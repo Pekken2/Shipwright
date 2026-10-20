@@ -347,6 +347,7 @@ typedef enum {
     RELIC_SPIRIT_CHAIN,    // kills zap the nearest enemy
     RELIC_SANDS_OF_TIME,   // more time on the room timer
     RELIC_LON_LON_MILK,    // heal after every cleared room
+    RELIC_MIRROR_SHARD,    // sword beams bounce off walls
     RELIC_COUNT,
 } Relic;
 
@@ -385,6 +386,7 @@ static const RelicInfo sRelicInfo[RELIC_COUNT] = {
     { "Spirit Chain", "Chain", "Every kill zaps the nearest enemy.", 3, false },
     { "Sands of Time", "Sands", "30 more seconds on the room timer.", 2, false },
     { "Lon Lon Milk", "Milk", "Heal a heart after every cleared room.", 2, false },
+    { "Mirror Shard", "Mirror", "Your sword beams bounce off walls twice more and fly farther.", 2, false },
 };
 
 static int sRelics[RELIC_COUNT];
@@ -407,7 +409,8 @@ static Relic PickRelic(bool devilDeal, const std::vector<Relic>& exclude) {
     std::vector<Relic> pool;
     for (int r = 0; r < RELIC_COUNT; r++) {
         Relic relic = (Relic)r;
-        if (sRelics[r] >= sRelicInfo[r].maxStacks || (devilDeal && !sRelicInfo[r].devil)) {
+        if (sRelics[r] >= sRelicInfo[r].maxStacks || (devilDeal && !sRelicInfo[r].devil) ||
+            (relic == RELIC_MIRROR_SHARD && !ROGUELIKE_SWORD_BEAM)) {
             continue;
         }
         if (std::find(exclude.begin(), exclude.end(), relic) != exclude.end()) {
@@ -3095,6 +3098,7 @@ static bool sBeamActive = false;
 static Vec3f sBeamPos;
 static Vec3f sBeamVel;
 static int sBeamLife = 0;
+static int sBeamBounces = 0; // Mirror Shard: wall bounces left
 static s8 sPrevMeleeState = 0;
 static constexpr f32 BEAM_SPEED = 24.0f;
 static constexpr int BEAM_LIFE = 22;
@@ -3148,7 +3152,8 @@ static void UpdateSwordBeam(PlayState* play) {
         sBeamPos = { player->actor.world.pos.x + fwdX * 30.0f, player->actor.world.pos.y + 35.0f,
                      player->actor.world.pos.z + fwdZ * 30.0f };
         sBeamVel = { fwdX * BEAM_SPEED, 0.0f, fwdZ * BEAM_SPEED };
-        sBeamLife = BEAM_LIFE;
+        sBeamLife = BEAM_LIFE + 10 * RelicCount(RELIC_MIRROR_SHARD);
+        sBeamBounces = 2 * RelicCount(RELIC_MIRROR_SHARD);
         sBeamActive = true;
         sBeamCollider.base.atFlags &= ~AT_HIT;
         Sfx_PlaySfxCentered(NA_SE_IT_SWORD_SWING_HARD);
@@ -3176,6 +3181,24 @@ static void UpdateSwordBeam(PlayState* play) {
     s32 bgId;
     if (BgCheck_EntityLineTest1(&play->colCtx, &sBeamPos, &next, &wallHit, &wallPoly, true, false, false, true,
                                 &bgId)) {
+        if (sBeamBounces > 0 && wallPoly != NULL) {
+            // Mirror Shard: reflect off the wall (flat, along the ground) and keep going.
+            f32 nx = COLPOLY_GET_NORMAL(wallPoly->normal.x);
+            f32 nz = COLPOLY_GET_NORMAL(wallPoly->normal.z);
+            f32 len = sqrtf(nx * nx + nz * nz);
+            if (len > 0.1f) {
+                nx /= len;
+                nz /= len;
+                f32 dot = sBeamVel.x * nx + sBeamVel.z * nz;
+                sBeamVel.x -= 2.0f * dot * nx;
+                sBeamVel.z -= 2.0f * dot * nz;
+                // Step back off the wall so the next move starts clear of it.
+                sBeamPos = { wallHit.x + nx * 4.0f, sBeamPos.y, wallHit.z + nz * 4.0f };
+                sBeamBounces--;
+                Sfx_PlaySfxCentered(NA_SE_IT_SHIELD_REFLECT_SW);
+                return;
+            }
+        }
         sBeamPos = wallHit;
         EndSwordBeam(play, true);
         return;
