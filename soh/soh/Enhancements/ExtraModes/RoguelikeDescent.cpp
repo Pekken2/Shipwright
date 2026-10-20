@@ -1357,6 +1357,34 @@ static bool IsChestRewardAvailable(RoguelikeReward reward) {
     }
 }
 
+// Chest contents are decided when a chest appears, from what Link owns at that moment. Two chests can therefore both
+// hold the same major item (say, two dungeon chests in one room, or a dungeon chest rolled before a floor reward
+// handed out that item), and the second one would give a duplicate. Check again as the chest opens and swap a
+// duplicate for something Link can still use.
+extern "C" GetItemEntry ItemTable_RetrieveEntry(s16 tableID, s16 getItemID);
+
+static bool IsDuplicateChestItem(s16 getItemId) {
+    for (int reward = 0; reward < REWARD_MAX; reward++) {
+        if (RewardToGetItem((RoguelikeReward)reward) == getItemId) {
+            return !IsChestRewardAvailable((RoguelikeReward)reward);
+        }
+    }
+    return false; // not a major item (hearts, ammo, relic rupees...)
+}
+
+static void FixDuplicateChestItem(Player* player) {
+    GetItemEntry& entry = player->getItemEntry;
+    s16 gi = (entry.objectId != OBJECT_INVALID && entry.modIndex == MOD_NONE) ? entry.getItemId
+                                                                              : (s16)std::abs(player->getItemId);
+    if (gi <= GI_NONE || !IsDuplicateChestItem(gi)) {
+        return;
+    }
+    bool isMajor = false;
+    GetItemID replacement = PickChestItem(&isMajor); // only offers items Link doesn't have yet
+    player->getItemId = -replacement;
+    player->getItemEntry = ItemTable_RetrieveEntry(MOD_NONE, replacement);
+}
+
 // A treasure flag that is unset in this scene and not already used by one of our chests.
 static s32 FindFreeTreasureFlag(PlayState* play) {
     for (s32 f = 31; f >= 0; f--) {
@@ -3099,7 +3127,6 @@ static void OnBossCleared(PlayState* play) {
 // Dungeon chests: the chests a dungeon already has get random run loot instead of their usual contents
 // ---------------------------------------------------------------------------------------------------------------------
 
-extern "C" GetItemEntry ItemTable_RetrieveEntry(s16 tableID, s16 getItemID);
 
 static bool IsSmallChestType(s32 type) {
     return type == ENBOX_TYPE_SMALL || type == ENBOX_TYPE_6 || type == ENBOX_TYPE_ROOM_CLEAR_SMALL ||
@@ -3740,6 +3767,12 @@ static void RegisterRoguelikeDescent() {
 
     // Masks stay on during runs: they don't come off when the mask leaves the C buttons, and they're put back on
     // after every floor change (same idea as the Persistent Masks enhancement).
+    // Never hand out a major item twice: re-check a chest's contents as it opens.
+    COND_VB_SHOULD(VB_OPEN_CHEST, true, {
+        if (sRun.active && *should && !IS_RANDO && gPlayState != NULL) {
+            FixDuplicateChestItem(GET_PLAYER(gPlayState));
+        }
+    });
     COND_VB_SHOULD(VB_PLAYER_UNEQUIP_MASK_WITHOUT_BUTTON, true, {
         if (sRun.active) {
             *should = false;
