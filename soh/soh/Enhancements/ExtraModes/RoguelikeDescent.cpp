@@ -70,6 +70,7 @@ void func_8083DDC8(Player* player, PlayState* play);
 #define ROGUELIKE_RELICS CVarGetInteger(CVAR_ROGUELIKE("Relics"), 1)
 #define ROGUELIKE_RANDOM_DUNGEON_CHESTS CVarGetInteger(CVAR_ROGUELIKE("RandomDungeonChests"), 1)
 #define ROGUELIKE_SWORD_BEAM CVarGetInteger(CVAR_ROGUELIKE("SwordBeam"), 1)
+#define ROGUELIKE_TARGET_CHALLENGE CVarGetInteger(CVAR_ROGUELIKE("TargetChallenge"), 1)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -1840,13 +1841,166 @@ static void SpawnSpikeTraps(PlayState* play, int count) {
     }
 }
 
+static std::vector<Actor*> sPillars; // this room's remix pillars (targets for the target challenge)
+
 static void SpawnPillars(PlayState* play, int count) {
     for (int i = 0; i < count; i++) {
         Vec3f pos;
         if (FindRemixSpot(play, 120.0f, 360.0f, 130.0f, &pos)) {
-            SpawnProp(play, ACTOR_OBJ_HSBLOCK, pos, 0, 0, false);
+            Actor* pillar = SpawnProp(play, ACTOR_OBJ_HSBLOCK, pos, 0, 0, false);
+            if (pillar != NULL) {
+                sPillars.push_back(pillar);
+            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Target challenge: after a room with pillars is cleared, hit every pillar in time (hookshot, arrow or sword beam)
+// for a bonus relic or item.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static bool sChallengeActive = false;
+static int sChallengeFrames = 0; // frames left
+static std::vector<bool> sPillarHit;
+
+static int CountPillarsHit() {
+    int hit = 0;
+    for (bool h : sPillarHit) {
+        hit += h ? 1 : 0;
+    }
+    return hit;
+}
+
+static void GiveRandomReward(PlayState* play);
+static Relic PickRelic(bool devilDeal, const std::vector<Relic>& exclude);
+static void GrantRelic(PlayState* play, Relic relic);
+
+static void StartTargetChallenge(PlayState* play) {
+    sChallengeActive = false;
+    int live = 0;
+    for (Actor* pillar : sPillars) {
+        live += (pillar != NULL && pillar->update != NULL) ? 1 : 0;
+    }
+    if (live < 2) {
+        return;
+    }
+    sPillarHit.assign(sPillars.size(), false);
+    for (size_t i = 0; i < sPillars.size(); i++) {
+        if (sPillars[i] == NULL || sPillars[i]->update == NULL) {
+            sPillarHit[i] = true; // gone already: doesn't count against Link
+        }
+    }
+    int seconds = std::max(15, 6 * live);
+    sChallengeFrames = seconds * FRAMES_PER_SECOND;
+    sChallengeActive = true;
+    Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
+    Notify("Target challenge! ", "Hit all " + std::to_string(live) + " pillars in " + std::to_string(seconds) +
+                                     " seconds with the hookshot, arrows or a sword beam for a bonus prize.");
+}
+
+static void RegisterPillarHit(PlayState* play, size_t index) {
+    if (!sChallengeActive || index >= sPillarHit.size() || sPillarHit[index]) {
+        return;
+    }
+    sPillarHit[index] = true;
+    Actor* pillar = sPillars[index];
+    if (pillar != NULL) {
+        Vec3f top = pillar->world.pos;
+        top.y += 80.0f;
+        Vec3f zero = { 0.0f, 0.0f, 0.0f };
+        Color_RGBA8 prim = { 255, 255, 200, 255 };
+        Color_RGBA8 env = { 255, 200, 0, 255 };
+        for (int i = 0; i < 8; i++) {
+            Vec3f vel = { RandFloat(-4.0f, 4.0f), RandFloat(1.0f, 5.0f), RandFloat(-4.0f, 4.0f) };
+            EffectSsKiraKira_SpawnDispersed(play, &top, &vel, &zero, &prim, &env, 3000, 10);
+        }
+    }
+    Sfx_PlaySfxCentered(NA_SE_SY_GET_RUPY);
+}
+
+// Called by the sword beam when it runs into scenery: counts if that scenery is one of the pillars.
+static void CheckBeamHitPillar(PlayState* play, s32 bgId) {
+    if (!sChallengeActive || bgId == BGCHECK_SCENE) {
+        return;
+    }
+    DynaPolyActor* dyna = DynaPoly_GetActor(&play->colCtx, bgId);
+    for (size_t i = 0; dyna != NULL && i < sPillars.size(); i++) {
+        if (sPillars[i] == &dyna->actor) {
+            RegisterPillarHit(play, i);
+        }
+    }
+}
+
+static bool NearPillar(Actor* pillar, const Vec3f& pos) {
+    f32 dy = pos.y - pillar->world.pos.y;
+    return Math_Vec3f_DistXZ((Vec3f*)&pos, &pillar->world.pos) < 55.0f && dy > -20.0f && dy < 220.0f;
+}
+
+// Returns true while the challenge is running.
+static bool UpdateTargetChallenge(PlayState* play) {
+    if (!sChallengeActive) {
+        return false;
+    }
+
+    for (size_t i = 0; i < sPillars.size(); i++) {
+        Actor* pillar = sPillars[i];
+        if (sPillarHit[i] || pillar == NULL || pillar->update == NULL) {
+            continue;
+        }
+        // Hookshot: latched onto the pillar.
+        if (CHECK_FLAG_ALL(pillar->flags, ACTOR_FLAG_HOOKSHOT_ATTACHED)) {
+            RegisterPillarHit(play, i);
+            continue;
+        }
+        // Arrows: a fired one (not one still on the bow string) at the pillar.
+        for (Actor* item = play->actorCtx.actorLists[ACTORCAT_ITEMACTION].head; item != NULL; item = item->next) {
+            if (item->id == ACTOR_EN_ARROW && item->parent == NULL && NearPillar(pillar, item->world.pos)) {
+                RegisterPillarHit(play, i);
+                break;
+            }
+        }
+        // Still waiting: sparkle above it so it's easy to spot.
+        if (!sPillarHit[i] && sChallengeFrames % 4 == 0) {
+            Vec3f top = pillar->world.pos;
+            top.y += 80.0f;
+            Vec3f zero = { 0.0f, 0.0f, 0.0f };
+            Vec3f vel = { 0.0f, 1.5f, 0.0f };
+            Color_RGBA8 prim = { 255, 255, 255, 255 };
+            Color_RGBA8 env = { 255, 120, 0, 255 };
+            EffectSsKiraKira_SpawnDispersed(play, &top, &vel, &zero, &prim, &env, 2500, 8);
+        }
+    }
+
+    int total = (int)sPillarHit.size();
+    int hit = CountPillarsHit();
+    if (hit >= total) {
+        sChallengeActive = false;
+        sRun.stateFrames = 0;
+        Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
+        Notify("Bullseye! ", "Every target hit.");
+        // The prize: a relic or a major item, whichever there's still something left of.
+        Relic relic = (ROGUELIKE_RELICS && RandInt(0, 1) == 0) ? PickRelic(false, {}) : RELIC_NONE;
+        if (relic != RELIC_NONE) {
+            GrantRelic(play, relic);
+        } else {
+            GiveRandomReward(play);
+        }
+        return false;
+    }
+
+    sChallengeFrames--;
+    if (sChallengeFrames > 0 && sChallengeFrames <= 5 * FRAMES_PER_SECOND && sChallengeFrames % FRAMES_PER_SECOND == 0) {
+        Sfx_PlaySfxCentered(NA_SE_SY_WARNING_COUNT_N); // the last five seconds tick down
+    }
+    if (sChallengeFrames <= 0) {
+        sChallengeActive = false;
+        sRun.stateFrames = 0;
+        Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
+        Notify("Time's up! ", std::to_string(hit) + " of " + std::to_string(total) + " targets hit.");
+        return false;
+    }
+    return true;
 }
 
 static void ApplyRoomRemix(PlayState* play) {
@@ -2172,6 +2326,7 @@ static void OnActorDestroyRoguelike(void* refActor) {
     sMiniBossActors.erase((Actor*)refActor);
     sArenaEnemies.erase(std::remove(sArenaEnemies.begin(), sArenaEnemies.end(), (Actor*)refActor), sArenaEnemies.end());
     std::replace(sRemixHazards.begin(), sRemixHazards.end(), (Actor*)refActor, (Actor*)NULL);
+    std::replace(sPillars.begin(), sPillars.end(), (Actor*)refActor, (Actor*)NULL);
     for (int i = 0; i < sChoiceCount; i++) {
         if (sChoiceChests[i].actor == refActor) {
             sChoiceChests[i].actor = NULL;
@@ -3051,6 +3206,9 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
 
     Sfx_PlaySfxCentered(NA_SE_SY_CORRECT_CHIME);
     GiveRoomClearRefill(play);
+    if (!sRun.arena && ROGUELIKE_TARGET_CHALLENGE) {
+        StartTargetChallenge(play);
+    }
     if (Wearing(PLAYER_MASK_KEATON)) {
         ApplyOwnHealthChange(play, 16); // Keaton Mask: a heart back
     }
@@ -3254,6 +3412,7 @@ static void UpdateSwordBeam(PlayState* play) {
     s32 bgId;
     if (BgCheck_EntityLineTest1(&play->colCtx, &sBeamPos, &next, &wallHit, &wallPoly, true, false, false, true,
                                 &bgId)) {
+        CheckBeamHitPillar(play, bgId);
         if (sBeamBounces > 0 && wallPoly != NULL) {
             // Mirror Shard: reflect off the wall (flat, along the ground) and keep going.
             f32 nx = COLPOLY_GET_NORMAL(wallPoly->normal.x);
@@ -3431,8 +3590,9 @@ static void OnPlayerUpdateRoguelike() {
             }
             break;
 
-        case ROOM_STATE_CLEARED:
-            if (UpdateRewardChoice(play)) {
+        case ROOM_STATE_CLEARED: {
+            bool challengeRunning = UpdateTargetChallenge(play);
+            if (UpdateRewardChoice(play) || challengeRunning) {
                 break;
             }
             if (sRun.chestFlag != CHEST_NONE) {
@@ -3454,6 +3614,7 @@ static void OnPlayerUpdateRoguelike() {
                 GoToNextFloor(play);
             }
             break;
+        }
 
         case ROOM_STATE_RUN_OVER:
             // Keep Link standing until the run wraps up.
@@ -3486,6 +3647,8 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sHurtThisRoom = false;
     sFuryKills = 0;
     sOwnChestFlags = 0;
+    sPillars.clear();
+    sChallengeActive = false;
     ResetSwordBeam();
     ResetStallCheck();
     sBossAmmoCooldown = 0;

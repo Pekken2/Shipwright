@@ -1987,6 +1987,11 @@ void SohMenu::AddMenuEnhancements() {
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "While your hearts are full, every sword swing also fires a beam that flies forward and hits the first "
             "enemy in its path, like the original Legend of Zelda. One beam at a time; walls stop it."));
+    AddWidget(path, "Pillar Target Challenge", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.TargetChallenge"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "After clearing a room that has remix pillars, a timed challenge starts: hit every pillar with the "
+            "hookshot, an arrow or a sword beam before time runs out to win a bonus relic or item."));
     AddWidget(path, "Relics & Devil Deals", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.Relics"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
