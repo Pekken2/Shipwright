@@ -1174,12 +1174,58 @@ static GetItemID PickChestItem(bool* isMajor) {
 }
 
 // Finds a clear patch of floor on Link's level, in the given distance band, with no wall in between.
+// True when a spot is too close to a way out of the room: a door or transition plane, a loading floor, or a
+// loading wall (like a dungeon's exit back to the overworld). Nothing the run spawns goes there.
+static bool IsNearLoadingZone(PlayState* play, const Vec3f& pos) {
+    static constexpr f32 DOOR_CLEARANCE = 130.0f;
+    static constexpr f32 EXIT_CLEARANCE = 110.0f;
+
+    // Doors and transition planes between rooms.
+    for (s32 i = 0; i < play->transiActorCtx.numActors; i++) {
+        const TransitionActorEntry* entry = &play->transiActorCtx.list[i];
+        Vec3f doorPos = { (f32)entry->pos.x, (f32)entry->pos.y, (f32)entry->pos.z };
+        if (Math_Vec3f_DistXZ((Vec3f*)&pos, &doorPos) < DOOR_CLEARANCE && fabsf(pos.y - doorPos.y) < 150.0f) {
+            return true;
+        }
+    }
+
+    // Loading floors: under the spot and a little around it.
+    static const f32 kOffsets[5][2] = { { 0, 0 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+    for (const auto& offset : kOffsets) {
+        Vec3f probe = { pos.x + offset[0] * EXIT_CLEARANCE * 0.7f, pos.y + 50.0f,
+                        pos.z + offset[1] * EXIT_CLEARANCE * 0.7f };
+        CollisionPoly* floorPoly = NULL;
+        s32 floorBgId = BGCHECK_SCENE;
+        f32 floorY = BgCheck_EntityRaycastFloor3(&play->colCtx, &floorPoly, &floorBgId, &probe);
+        if (floorPoly != NULL && floorY > BGCHECK_Y_MIN + 1.0f && fabsf(floorY - pos.y) < 100.0f &&
+            SurfaceType_GetSceneExitIndex(&play->colCtx, floorPoly, floorBgId) != 0) {
+            return true;
+        }
+    }
+
+    // Loading walls: look around in eight directions.
+    Vec3f origin = { pos.x, pos.y + 30.0f, pos.z };
+    for (int dir = 0; dir < 8; dir++) {
+        s16 yaw = (s16)(dir * 0x2000);
+        Vec3f target = { origin.x + Math_SinS(yaw) * EXIT_CLEARANCE, origin.y, origin.z + Math_CosS(yaw) * EXIT_CLEARANCE };
+        Vec3f hit;
+        CollisionPoly* wallPoly = NULL;
+        s32 wallBgId = BGCHECK_SCENE;
+        if (BgCheck_EntityLineTest1(&play->colCtx, &origin, &target, &hit, &wallPoly, true, false, false, true,
+                                    &wallBgId) &&
+            wallPoly != NULL && SurfaceType_GetSceneExitIndex(&play->colCtx, wallPoly, wallBgId) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool FindFloorSpotNearPlayer(PlayState* play, f32 minRadius, f32 maxRadius, Vec3f* outPos) {
     Player* player = GET_PLAYER(play);
     Vec3f origin = player->actor.world.pos;
     origin.y += 30.0f;
 
-    for (int attempt = 0; attempt < 16; attempt++) {
+    for (int attempt = 0; attempt < 24; attempt++) {
         f32 angle = RandFloat(0.0f, 6.2831853f);
         f32 radius = RandFloat(minRadius, maxRadius);
 
@@ -1200,7 +1246,11 @@ static bool FindFloorSpotNearPlayer(PlayState* play, f32 minRadius, f32 maxRadiu
             continue; // no floor, or a pit / ledge
         }
 
-        *outPos = { target.x, floorY, target.z };
+        Vec3f spot = { target.x, floorY, target.z };
+        if (IsNearLoadingZone(play, spot)) {
+            continue; // too close to a door or a way out
+        }
+        *outPos = spot;
         return true;
     }
     return false;
@@ -1421,7 +1471,11 @@ static bool IsReachableFloorSpot(PlayState* play, Vec3f target, Vec3f* outPos) {
     if (floorPoly == NULL || floorY <= BGCHECK_Y_MIN + 1.0f || fabsf(floorY - player->actor.world.pos.y) > 60.0f) {
         return false;
     }
-    *outPos = { target.x, floorY, target.z };
+    Vec3f spot = { target.x, floorY, target.z };
+    if (IsNearLoadingZone(play, spot)) {
+        return false;
+    }
+    *outPos = spot;
     return true;
 }
 
