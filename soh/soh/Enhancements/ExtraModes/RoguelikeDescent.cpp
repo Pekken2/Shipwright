@@ -1231,7 +1231,8 @@ static bool TrySpawnRewardChest(PlayState* play) {
     bool isMajor = false;
     GetItemID item = PickChestItem(&isMajor);
     Player* player = GET_PLAYER(play);
-    s16 yaw = Math_Vec3f_Yaw(&pos, &player->actor.world.pos); // open side faces Link
+    // A chest opens from its back (local -Z), so it faces away from Link to put the lid towards him.
+    s16 yaw = Math_Vec3f_Yaw(&player->actor.world.pos, &pos);
 
     sOwnChestFlags |= 1u << flag;
     Actor* chest = Actor_Spawn(&play->actorCtx, play, ACTOR_EN_BOX, pos.x, pos.y, pos.z, 0, yaw, 0,
@@ -1525,7 +1526,7 @@ static bool SpawnRewardChoice(PlayState* play, bool guaranteeRelic) {
         }
         const Offer& offer = offers[i];
         Player* link = GET_PLAYER(play);
-        s16 yaw = Math_Vec3f_Yaw(&pos, &link->actor.world.pos);
+        s16 yaw = Math_Vec3f_Yaw(&link->actor.world.pos, &pos); // lid towards Link (see TrySpawnRewardChest)
         // Devil deals use the ornate boss key chest so they stand out.
         s16 type = offer.devil ? ENBOX_TYPE_DECORATED_BIG : ENBOX_TYPE_BIG_DEFAULT;
         sOwnChestFlags |= 1u << flag;
