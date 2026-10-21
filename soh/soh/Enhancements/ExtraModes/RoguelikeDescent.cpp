@@ -3748,9 +3748,11 @@ static void OnPlayerHealthChangeRoguelike(int16_t amount) {
         Notify("Second Wind! ", "You cling to life.");
         return;
     }
-    // Permadeath: instead of the game over screen, end the run.
+    // Permadeath: instead of the game over screen, end the run. Health is held at the smallest amount above zero
+    // (shown as a sliver of a heart) only so the game's own death and game over sequence doesn't start.
     gSaveContext.health = 1;
     Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
+    Notify("You were defeated! ", "The run is over.");
     EnterRoomState(ROOM_STATE_RUN_OVER);
 }
 
