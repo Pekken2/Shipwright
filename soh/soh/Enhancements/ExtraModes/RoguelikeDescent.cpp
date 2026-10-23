@@ -51,6 +51,7 @@ extern "C" {
 #include "src/overlays/actors/ovl_En_Box/z_en_box.h"
 #include "src/overlays/actors/ovl_En_Arrow/z_en_arrow.h"
 #include "src/overlays/actors/ovl_Arms_Hook/z_arms_hook.h"
+#include "src/overlays/actors/ovl_En_Rd/z_en_rd.h"
 extern PlayState* gPlayState;
 void func_8083DF68(Player* player, f32 arg1, s16 arg2); // Player: steer towards a speed/yaw target
 void func_8083DDC8(Player* player, PlayState* play);
@@ -4677,8 +4678,71 @@ static bool OnMainPauseScreen(PlayState* play) {
 }
 
 // Escape hatch for soft locks: holding the button on the pause screen ends the run once the game is unpaused.
+// ---------------------------------------------------------------------------------------------------------------------
+// Stun-lock protection: ReDeads and Gibdos can't chain their freezing scream, nothing freezes or grabs Link mid-spell,
+// and a freeze that somehow lasts too long is broken.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static int sScreamImmunity = 0; // frames until a scream can freeze Link again
+static int sFrozenFrames = 0;   // how long Link has been frozen in a row
+
+static bool SpellActive(PlayState* play) {
+    return Actor_Find(&play->actorCtx, ACTOR_MAGIC_FIRE, ACTORCAT_ITEMACTION) != NULL ||
+           Actor_Find(&play->actorCtx, ACTOR_MAGIC_WIND, ACTORCAT_ITEMACTION) != NULL ||
+           Actor_Find(&play->actorCtx, ACTOR_MAGIC_DARK, ACTORCAT_ITEMACTION) != NULL;
+}
+
+// Whether a ReDead/Gibdo scream may freeze Link right now. Starts the group cooldown when it may.
+static bool AllowScreamFreeze() {
+    PlayState* play = gPlayState;
+    if (!sRun.active || play == NULL) {
+        return true;
+    }
+    if (sScreamImmunity > 0 || SpellActive(play)) {
+        return false;
+    }
+    sScreamImmunity = 5 * FRAMES_PER_SECOND; // the freeze itself takes 2-3 seconds of this
+    return true;
+}
+
+static void UpdateStunLockGuards(PlayState* play) {
+    if (sScreamImmunity > 0) {
+        sScreamImmunity--;
+    }
+    Player* player = GET_PLAYER(play);
+    if (player == NULL) {
+        return;
+    }
+
+    // While a spell is going off, ReDeads and Gibdos hold off on grabbing.
+    if (SpellActive(play)) {
+        for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; actor != NULL; actor = actor->next) {
+            if (actor->id == ACTOR_EN_RD) {
+                EnRd* rd = (EnRd*)actor;
+                rd->grabWaitTimer = (u8)std::max<int>(rd->grabWaitTimer, 10);
+            }
+        }
+    }
+
+    // A freeze (from anything) lasting over 5 seconds straight is broken, with a moment of immunity after.
+    if (player->actor.freezeTimer > 0) {
+        if (++sFrozenFrames > 5 * FRAMES_PER_SECOND) {
+            player->actor.freezeTimer = 0;
+            sFrozenFrames = 0;
+            sScreamImmunity = 3 * FRAMES_PER_SECOND;
+            Notify("You shake free!");
+        }
+    } else {
+        sFrozenFrames = 0;
+    }
+}
+
 static void OnGameFrameUpdateRoguelike() {
     PlayState* play = gPlayState;
+    // Gameplay frames only (not while paused or in a text box).
+    if (sRun.active && play != NULL && play->pauseCtx.state == 0 && play->msgCtx.msgMode == MSGMODE_NONE) {
+        UpdateStunLockGuards(play);
+    }
     if (!sRun.active || sAbandonRequested || !OnMainPauseScreen(play)) {
         sEndRunHoldFrames = 0;
         return;
@@ -4877,6 +4941,11 @@ static void RegisterRoguelikeDescent() {
     COND_HOOK(OnLoadGame, true, OnLoadGameRoguelike);
     COND_ID_HOOK(OnActorInit, ACTOR_EN_BOX, true, OnChestInitRoguelike);
     COND_HOOK(OnGameFrameUpdate, true, OnGameFrameUpdateRoguelike);
+    COND_VB_SHOULD(VB_REDEAD_GIBDO_FREEZE_LINK, true, {
+        if (*should && !AllowScreamFreeze()) {
+            *should = false;
+        }
+    });
     COND_HOOK(OnItemReceive, true, OnItemReceiveRoguelike);
 
     // Masks stay on during runs: they don't come off when the mask leaves the C buttons, and they're put back on
