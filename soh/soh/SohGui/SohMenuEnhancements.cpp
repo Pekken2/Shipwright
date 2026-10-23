@@ -1992,6 +1992,18 @@ void SohMenu::AddMenuEnhancements() {
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "After clearing a room that has remix pillars, a timed challenge starts: hit every pillar with the "
             "hookshot, an arrow or a sword beam before time runs out to win a bonus relic or item."));
+    AddWidget(path, "Shop Floors & Rupees", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Shops"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Enemies drop rupees, runs start with the Adult's Wallet, and every few floors there's a shop floor "
+            "with no enemies: stand on a glowing spot to see what it sells and its price, and stay there to buy. "
+            "Relics, a mystery major item, a full heal and a heart container are on offer. The blue light leads on."));
+    AddWidget(path, "Shop Every %d Floors", WIDGET_CVAR_SLIDER_INT)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.ShopEvery"))
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = CVarGetInteger(CVAR_ENHANCEMENT("Roguelike.Shops"), 1) == 0;
+        })
+        .Options(IntSliderOptions().Min(3).Max(10).DefaultValue(4).Format("%d"));
     AddWidget(path, "Relics & Devil Deals", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.Relics"))
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(

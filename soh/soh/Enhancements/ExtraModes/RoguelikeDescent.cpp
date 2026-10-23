@@ -71,6 +71,8 @@ void func_8083DDC8(Player* player, PlayState* play);
 #define ROGUELIKE_RANDOM_DUNGEON_CHESTS CVarGetInteger(CVAR_ROGUELIKE("RandomDungeonChests"), 1)
 #define ROGUELIKE_SWORD_BEAM CVarGetInteger(CVAR_ROGUELIKE("SwordBeam"), 1)
 #define ROGUELIKE_TARGET_CHALLENGE CVarGetInteger(CVAR_ROGUELIKE("TargetChallenge"), 1)
+#define ROGUELIKE_SHOPS CVarGetInteger(CVAR_ROGUELIKE("Shops"), 1)
+#define ROGUELIKE_SHOP_EVERY CVarGetInteger(CVAR_ROGUELIKE("ShopEvery"), 4)
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -223,6 +225,7 @@ typedef enum {
     ROOM_STATE_CLEARED,  // counting down to the next floor
     ROOM_STATE_RUN_OVER, // Link died, counting down to the end of the run
     ROOM_STATE_BOSS,     // boss floor: waiting for the boss to fall
+    ROOM_STATE_SHOP,     // shop floor: buying, then the exit spot
 } RoomState;
 
 typedef enum {
@@ -272,6 +275,7 @@ static struct {
     FloorModifier modifier; // this floor's twist, if any
     RoomRemix remix;        // this floor's prop/trap layout, if any
     bool arena;             // an open-world survival floor
+    bool shop;              // a shop floor: no enemies, things to buy
     s16 expectedScene;      // where this floor takes place; landing anywhere else means Link left (fled)
     bool fled;
     bool miniBoss; // a boss floor where no boss could be beaten with Link's gear: tough enemies instead
@@ -351,6 +355,7 @@ typedef enum {
     RELIC_SANDS_OF_TIME,   // more time on the room timer
     RELIC_LON_LON_MILK,    // heal after every cleared room
     RELIC_MIRROR_SHARD,    // sword beams bounce off walls
+    RELIC_FAIRY_FRIEND,    // a fairy companion that attacks enemies
     RELIC_COUNT,
 } Relic;
 
@@ -390,10 +395,13 @@ static const RelicInfo sRelicInfo[RELIC_COUNT] = {
     { "Sands of Time", "Sands", "30 more seconds on the room timer.", 2, false },
     { "Lon Lon Milk", "Milk", "Heal a heart after every cleared room.", 2, false },
     { "Mirror Shard", "Mirror", "Your sword beams bounce off walls twice more and fly farther.", 2, false },
+    { "Fairy Friend", "Fairy", "A fairy fights at your side, darting at nearby enemies. More of them, faster.", 3,
+      false },
 };
 
 static int sRelics[RELIC_COUNT];
 static bool sHurtThisRoom = false; // Flawless Charm
+static Actor* sFairyTarget = NULL;  // Fairy Friend: the enemy she's darting at
 static int sFuryKills = 0;         // Battle Fury: kills since Link was last hurt
 static int sRegenFrames = 0;       // Fairy's Blessing
 static int sBombRegenFrames = 0;   // Blast Pouch
@@ -2382,6 +2390,9 @@ static void OnActorDestroyRoguelike(void* refActor) {
     sArenaEnemies.erase(std::remove(sArenaEnemies.begin(), sArenaEnemies.end(), (Actor*)refActor), sArenaEnemies.end());
     std::replace(sRemixHazards.begin(), sRemixHazards.end(), (Actor*)refActor, (Actor*)NULL);
     std::replace(sPillars.begin(), sPillars.end(), (Actor*)refActor, (Actor*)NULL);
+    if (sFairyTarget == refActor) {
+        sFairyTarget = NULL;
+    }
     for (int i = 0; i < sChoiceCount; i++) {
         if (sChoiceChests[i].actor == refActor) {
             sChoiceChests[i].actor = NULL;
@@ -2405,6 +2416,13 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     sEnemies.erase(it);
     sRun.kills++;
     sFuryKills++;
+
+    // Rupees for the shops: most enemies drop one.
+    if (ROGUELIKE_SHOPS && RandInt(1, 100) <= 60) {
+        int roll = RandInt(1, 100);
+        s16 rupee = roll <= 55 ? ITEM00_RUPEE_GREEN : (roll <= 90 ? ITEM00_RUPEE_BLUE : ITEM00_RUPEE_RED);
+        Item_DropCollectible(play, &deathPos, rupee);
+    }
 
     // Fortune Tunic: a heart now and then.
     if (WearingTunic(RTUNIC_FORTUNE) && RandInt(1, 100) <= 35) {
@@ -2819,6 +2837,7 @@ static s32 PrepareBossFloor() {
 
     WearTunicFor(boss.tunic);
     sPendingRoomPick = false;
+    sRun.shop = false;
     sRun.bossFloor = true;
     sRun.bossDefeated = false;
     sRun.bossWaitFrames = 0;
@@ -2886,6 +2905,8 @@ static void TriggerTransition(PlayState* play, s32 entrance) {
     play->transitionType = TRANS_TYPE_FADE_BLACK;
 }
 
+static bool IsShopFloor(int floor);
+
 // Picks the next floor's dungeon and sets everything up for the room drop. Returns the entrance to load.
 static s32 PrepareNextFloor() {
     sRun.floor++;
@@ -2900,10 +2921,12 @@ static s32 PrepareNextFloor() {
         sRun.miniBossSet = RandInt(0, (int)ARRAY_COUNT(sMiniBossSets) - 1);
     }
     sRun.bossFloor = false;
-    sRun.modifier = sRun.miniBoss ? FLOORMOD_NONE : RollFloorModifier(sRun.floor);
-    sRun.remix = sRun.miniBoss ? REMIX_NONE : RollRoomRemix();
+    sRun.shop = !sRun.miniBoss && IsShopFloor(sRun.floor);
+    bool calm = sRun.miniBoss || sRun.shop;
+    sRun.modifier = calm ? FLOORMOD_NONE : RollFloorModifier(sRun.floor);
+    sRun.remix = calm ? REMIX_NONE : RollRoomRemix();
 
-    if (!sRun.miniBoss && IsArenaFloor(sRun.floor)) {
+    if (!calm && IsArenaFloor(sRun.floor)) {
         s32 entrance = PrepareArenaFloor();
         if (sRun.modifier != FLOORMOD_NONE) {
             Notify(std::string(sModifierNames[sRun.modifier]) + "! ", sModifierDescriptions[sRun.modifier]);
@@ -2932,6 +2955,9 @@ static s32 PrepareNextFloor() {
     sRun.lastDungeon = dungeon;
 
     Notify("Floor " + std::to_string(sRun.floor) + ": ", d.name);
+    if (sRun.shop) {
+        Notify("Shop floor! ", "Time to spend those rupees.");
+    }
     if (sRun.miniBoss) {
         Notify("MINI-BOSS: ", sMiniBossSets[sRun.miniBossSet].name);
     }
@@ -2994,6 +3020,10 @@ static void ApplyStartingLoadout() {
     gSaveContext.isDoubleDefenseAcquired = false;
     gSaveContext.bgsFlag = false;
     gSaveContext.rupees = 0;
+    gSaveContext.rupeeAccumulator = 0;
+    if (ROGUELIKE_SHOPS) {
+        Inventory_ChangeUpgrade(UPG_WALLET, 1); // the Adult's Wallet (200), so there's room to save up for shops
+    }
     gSaveContext.nayrusLoveTimer = 0;
     gSaveContext.ship.maskMemory = PLAYER_MASK_NONE;
 
@@ -3024,6 +3054,7 @@ static void ResetRunState() {
     sRun.miniBossSet = 0;
     sRun.tunic = RTUNIC_NONE;
     sRun.blade = RBLADE_NONE;
+    sRun.shop = false;
     sThunderHits = 0;
     sComboHits = 0;
     sComboFrames = COMBO_WINDOW + 1;
@@ -3508,6 +3539,380 @@ static void UpdateSwordBeam(PlayState* play) {
     CollisionCheck_SetAT(play, &play->colChkCtx, &sBeamCollider.base);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Fairy Friend: a fairy circles Link's head and every few seconds darts at the nearest enemy
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef enum {
+    FAIRY_ORBIT,
+    FAIRY_DASH,
+    FAIRY_RETURN,
+} FairyState;
+
+static ColliderCylinderInit sFairyColliderInit = {
+    { COLTYPE_NONE, AT_ON | AT_TYPE_PLAYER, AC_NONE, OC1_NONE, OC2_NONE, COLSHAPE_CYLINDER },
+    { ELEMTYPE_UNK2, { DMG_SLASH_KOKIRI, 0x00, 0x01 }, { 0x00000000, 0x00, 0x00 }, TOUCH_ON | TOUCH_SFX_NORMAL,
+      BUMP_NONE, OCELEM_NONE },
+    { 14, 24, -12, { 0, 0, 0 } },
+};
+
+static ColliderCylinder sFairyCollider;
+static Actor* sFairyColliderOwner = NULL;
+static FairyState sFairyState = FAIRY_ORBIT;
+static Vec3f sFairyPos;
+static bool sFairyPlaced = false;
+static f32 sFairyAngle = 0.0f;
+static int sFairyCooldown = 0;
+static int sFairyDashFrames = 0;
+static constexpr f32 FAIRY_SPEED = 18.0f;
+
+static void ResetFairy() {
+    sFairyState = FAIRY_ORBIT;
+    sFairyPlaced = false;
+    sFairyTarget = NULL;
+    sFairyColliderOwner = NULL;
+    sFairyCooldown = 2 * FRAMES_PER_SECOND;
+}
+
+// Moves `pos` towards `dest` by up to `speed`. Returns the distance that was left before the move.
+static f32 MoveTowards(Vec3f* pos, const Vec3f& dest, f32 speed) {
+    Vec3f diff = { dest.x - pos->x, dest.y - pos->y, dest.z - pos->z };
+    f32 dist = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+    if (dist <= speed || dist < 0.01f) {
+        *pos = dest;
+    } else {
+        pos->x += diff.x / dist * speed;
+        pos->y += diff.y / dist * speed;
+        pos->z += diff.z / dist * speed;
+    }
+    return dist;
+}
+
+static Actor* FindFairyTarget(PlayState* play, Player* player) {
+    Actor* best = NULL;
+    f32 bestDist = 380.0f;
+    for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; actor != NULL; actor = actor->next) {
+        if (actor->update == NULL || actor->colChkInfo.health == 0 || EnemyNeedsMissingGear(actor)) {
+            continue;
+        }
+        f32 dist = Actor_WorldDistXYZToActor(actor, &player->actor);
+        if (dist < bestDist) {
+            best = actor;
+            bestDist = dist;
+        }
+    }
+    return best;
+}
+
+static void UpdateFairyCompanion(PlayState* play) {
+    Player* player = GET_PLAYER(play);
+    if (!HasRelic(RELIC_FAIRY_FRIEND) || player == NULL) {
+        return;
+    }
+    if (sFairyColliderOwner != &player->actor) {
+        Collider_InitCylinder(play, &sFairyCollider);
+        Collider_SetCylinder(play, &sFairyCollider, &player->actor, &sFairyColliderInit);
+        sFairyColliderOwner = &player->actor;
+    }
+
+    // The spot she circles: around Link's head.
+    sFairyAngle += 0.12f;
+    Vec3f orbit = { player->actor.world.pos.x + cosf(sFairyAngle) * 38.0f,
+                    player->actor.world.pos.y + 62.0f + sinf(sFairyAngle * 2.0f) * 6.0f,
+                    player->actor.world.pos.z + sinf(sFairyAngle) * 38.0f };
+    if (!sFairyPlaced) {
+        sFairyPos = orbit;
+        sFairyPlaced = true;
+    }
+
+    switch (sFairyState) {
+        case FAIRY_ORBIT:
+            MoveTowards(&sFairyPos, orbit, FAIRY_SPEED);
+            if (--sFairyCooldown <= 0) {
+                sFairyTarget = FindFairyTarget(play, player);
+                if (sFairyTarget != NULL) {
+                    sFairyState = FAIRY_DASH;
+                    sFairyDashFrames = 0;
+                    sFairyCollider.base.atFlags &= ~AT_HIT;
+                    Sfx_PlaySfxCentered(NA_SE_EV_FAIRY_DASH);
+                } else {
+                    sFairyCooldown = FRAMES_PER_SECOND / 2; // look again soon
+                }
+            }
+            break;
+
+        case FAIRY_DASH:
+            if (sFairyCollider.base.atFlags & AT_HIT) {
+                sFairyCollider.base.atFlags &= ~AT_HIT;
+                Vec3f zero = { 0.0f, 0.0f, 0.0f };
+                Color_RGBA8 prim = { 255, 255, 255, 255 };
+                Color_RGBA8 env = { 255, 150, 220, 255 };
+                for (int i = 0; i < 5; i++) {
+                    Vec3f vel = { RandFloat(-3.0f, 3.0f), RandFloat(0.0f, 3.0f), RandFloat(-3.0f, 3.0f) };
+                    EffectSsKiraKira_SpawnDispersed(play, &sFairyPos, &vel, &zero, &prim, &env, 2000, 8);
+                }
+                sFairyState = FAIRY_RETURN;
+                break;
+            }
+            if (sFairyTarget == NULL || ++sFairyDashFrames > 2 * FRAMES_PER_SECOND) {
+                sFairyState = FAIRY_RETURN;
+                break;
+            }
+            MoveTowards(&sFairyPos, sFairyTarget->focus.pos, FAIRY_SPEED);
+            sFairyCollider.dim.pos.x = (s16)sFairyPos.x;
+            sFairyCollider.dim.pos.y = (s16)sFairyPos.y;
+            sFairyCollider.dim.pos.z = (s16)sFairyPos.z;
+            CollisionCheck_SetAT(play, &play->colChkCtx, &sFairyCollider.base);
+            break;
+
+        case FAIRY_RETURN:
+            if (MoveTowards(&sFairyPos, orbit, FAIRY_SPEED) < 25.0f) {
+                sFairyState = FAIRY_ORBIT;
+                // 3 seconds between attacks, 2 with two fairies' worth, 1.5 with three.
+                int stacks = RelicCount(RELIC_FAIRY_FRIEND);
+                sFairyCooldown = stacks >= 3 ? 30 : (stacks == 2 ? 40 : 60);
+            }
+            break;
+    }
+
+    // Her glow.
+    Vec3f zero = { 0.0f, 0.0f, 0.0f };
+    Color_RGBA8 prim = { 255, 255, 255, 255 };
+    Color_RGBA8 env = { 255, 140, 220, 255 };
+    EffectSsKiraKira_SpawnDispersed(play, &sFairyPos, &zero, &zero, &prim, &env, 3200, 4);
+    if (sFairyState != FAIRY_ORBIT) {
+        EffectSsKiraKira_SpawnDispersed(play, &sFairyPos, &zero, &zero, &prim, &env, 1800, 6); // a trail
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Shop floors: no enemies, glowing spots to buy things with rupees, and a spot that leads on
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef enum {
+    SHOP_RELIC,
+    SHOP_TREASURE, // a random major item
+    SHOP_HEAL,     // full heal
+    SHOP_HEART,    // +1 heart container
+    SHOP_EXIT,
+} ShopKind;
+
+typedef struct {
+    Vec3f pos;
+    ShopKind kind;
+    Relic relic;
+    int price;
+    bool sold;
+} ShopSlot;
+
+static std::vector<ShopSlot> sShopSlots;
+static int sShopStandSlot = -1;   // the spot Link is on
+static int sShopStandFrames = 0;
+static bool sShopArmed = false;   // spots only work once Link has stepped off them (he may land on one)
+static constexpr int SHOP_BUY_FRAMES = 25;
+static constexpr int SHOP_EXIT_FRAMES = 30;
+
+static bool IsShopFloor(int floor) {
+    int every = std::max(3, ROGUELIKE_SHOP_EVERY);
+    return ROGUELIKE_SHOPS && floor % every == every - 1 && !IsBossFloor(floor);
+}
+
+static bool AnyMajorRewardLeft() {
+    for (int reward = 0; reward < REWARD_MAX; reward++) {
+        if (RewardToGetItem((RoguelikeReward)reward) != GI_NONE && IsRewardAvailable((RoguelikeReward)reward)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void GiveShopTreasure(PlayState* play) {
+    std::vector<RoguelikeReward> pool;
+    for (int reward = 0; reward < REWARD_MAX; reward++) {
+        if (RewardToGetItem((RoguelikeReward)reward) != GI_NONE && IsRewardAvailable((RoguelikeReward)reward)) {
+            pool.push_back((RoguelikeReward)reward);
+        }
+    }
+    if (pool.empty()) {
+        GiveRandomReward(play);
+        return;
+    }
+    GiveReward(play, pool[RandInt(0, (int)pool.size() - 1)]);
+}
+
+static std::string ShopSlotName(const ShopSlot& slot) {
+    switch (slot.kind) {
+        case SHOP_RELIC:
+            return std::string("Relic: ") + sRelicInfo[slot.relic].name + " - " + sRelicInfo[slot.relic].description;
+        case SHOP_TREASURE:
+            return "Mystery treasure - a random major item you don't have yet.";
+        case SHOP_HEAL:
+            return "Red Potion - a full heal.";
+        case SHOP_HEART:
+            return "Heart Container - one more heart.";
+        default:
+            return "The way down - stay here to move on.";
+    }
+}
+
+static void SetupShop(PlayState* play) {
+    sShopSlots.clear();
+    sShopStandSlot = -1;
+    sShopStandFrames = 0;
+    sShopArmed = false;
+    sRemixSpots.clear();
+
+    // Shops are safe: the room's own monsters are chased off.
+    for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; actor != NULL; actor = actor->next) {
+        Vec3f pos = actor->world.pos;
+        pos.y += 20.0f;
+        Vec3f zero = { 0.0f, 0.0f, 0.0f };
+        EffectSsDeadDb_Spawn(play, &pos, &zero, &zero, 100, 0, 255, 255, 255, 255, 0, 0, 255, 1, 9, true);
+        Actor_Kill(actor);
+    }
+
+    int floorCost = 4 * sRun.floor;
+    std::vector<ShopSlot> stock;
+    std::vector<Relic> offered;
+    for (int i = 0; i < 2 && ROGUELIKE_RELICS; i++) {
+        Relic relic = PickRelic(false, offered);
+        if (relic != RELIC_NONE) {
+            offered.push_back(relic);
+            stock.push_back({ {}, SHOP_RELIC, relic, (sRelicInfo[relic].devil ? 95 : 65) + floorCost, false });
+        }
+    }
+    if (AnyMajorRewardLeft()) {
+        stock.push_back({ {}, SHOP_TREASURE, RELIC_NONE, 80 + floorCost, false });
+    }
+    stock.push_back({ {}, SHOP_HEAL, RELIC_NONE, 30, false });
+    if (gSaveContext.healthCapacity < 20 * 16) {
+        stock.push_back({ {}, SHOP_HEART, RELIC_NONE, 90 + floorCost, false });
+    }
+
+    for (ShopSlot slot : stock) {
+        if (FindRemixSpot(play, 110.0f, 320.0f, 95.0f, &slot.pos)) {
+            sShopSlots.push_back(slot);
+        }
+    }
+    // The way on. If there's truly nowhere to put it, it goes where Link stands (he has to step off first).
+    ShopSlot exit = { {}, SHOP_EXIT, RELIC_NONE, 0, false };
+    if (!FindRemixSpot(play, 140.0f, 360.0f, 95.0f, &exit.pos)) {
+        exit.pos = GET_PLAYER(play)->actor.world.pos;
+    }
+    sShopSlots.push_back(exit);
+
+    Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
+    Notify("Shop! ", "Stand on a glowing spot to see what it is and its price, and stay there to buy it. "
+                     "The blue light leads on.");
+}
+
+static void BuyShopSlot(PlayState* play, ShopSlot& slot) {
+    int wallet = gSaveContext.rupees + gSaveContext.rupeeAccumulator;
+    if (wallet < slot.price) {
+        Sfx_PlaySfxCentered(NA_SE_SY_ERROR);
+        Notify("Not enough rupees. ", "You have " + std::to_string(wallet) + ".");
+        return;
+    }
+    Rupees_ChangeBy((s16)-slot.price);
+    slot.sold = true;
+    switch (slot.kind) {
+        case SHOP_RELIC:
+            Audio_PlayFanfare(NA_BGM_ITEM_GET | 0x900);
+            GrantRelic(play, slot.relic);
+            break;
+        case SHOP_TREASURE:
+            GiveShopTreasure(play);
+            break;
+        case SHOP_HEAL:
+            gSaveContext.health = gSaveContext.healthCapacity;
+            Sfx_PlaySfxCentered(NA_SE_EV_FIATY_HEAL);
+            Notify("Fully healed.");
+            break;
+        case SHOP_HEART:
+            gSaveContext.healthCapacity = (s16)std::min(gSaveContext.healthCapacity + 16, 20 * 16);
+            gSaveContext.health = (s16)std::min(gSaveContext.health + 16, (int)gSaveContext.healthCapacity);
+            Audio_PlayFanfare(NA_BGM_ITEM_GET | 0x900);
+            Notify("Heart Container! ", "One more heart.");
+            break;
+        default:
+            break;
+    }
+}
+
+static void UpdateShop(PlayState* play) {
+    Player* player = GET_PLAYER(play);
+
+    // Light up the spots.
+    if (sRun.stateFrames % 3 == 0) {
+        Vec3f accel = { 0.0f, 0.0f, 0.0f };
+        for (const ShopSlot& slot : sShopSlots) {
+            if (slot.sold) {
+                continue;
+            }
+            Color_RGBA8 env;
+            switch (slot.kind) {
+                case SHOP_RELIC:
+                    env = { 190, 80, 255, 255 };
+                    break;
+                case SHOP_TREASURE:
+                    env = { 255, 200, 40, 255 };
+                    break;
+                case SHOP_EXIT:
+                    env = { 60, 140, 255, 255 };
+                    break;
+                default:
+                    env = { 80, 255, 120, 255 };
+                    break;
+            }
+            Color_RGBA8 prim = { 255, 255, 255, 255 };
+            Vec3f pos = { slot.pos.x + RandFloat(-12.0f, 12.0f), slot.pos.y + 10.0f, slot.pos.z + RandFloat(-12.0f, 12.0f) };
+            Vec3f vel = { 0.0f, slot.kind == SHOP_EXIT ? 4.0f : 2.0f, 0.0f };
+            EffectSsKiraKira_SpawnDispersed(play, &pos, &vel, &accel, &prim, &env, 3000, 12);
+        }
+    }
+
+    // Which spot is Link on?
+    int on = -1;
+    for (int i = 0; i < (int)sShopSlots.size(); i++) {
+        const ShopSlot& slot = sShopSlots[i];
+        if (!slot.sold && Math_Vec3f_DistXZ(&player->actor.world.pos, (Vec3f*)&slot.pos) < 45.0f &&
+            fabsf(player->actor.world.pos.y - slot.pos.y) < 60.0f) {
+            on = i;
+            break;
+        }
+    }
+    if (on < 0) {
+        sShopStandSlot = -1;
+        sShopStandFrames = 0;
+        sShopArmed = true;
+        return;
+    }
+    if (!sShopArmed) {
+        return;
+    }
+    ShopSlot& slot = sShopSlots[on];
+    if (on != sShopStandSlot) {
+        sShopStandSlot = on;
+        sShopStandFrames = 0;
+        Sfx_PlaySfxCentered(NA_SE_SY_CURSOR);
+        if (slot.kind == SHOP_EXIT) {
+            Notify(ShopSlotName(slot));
+        } else {
+            Notify(std::to_string(slot.price) + " rupees. ", ShopSlotName(slot) + " Stay here to buy.");
+        }
+        return;
+    }
+    sShopStandFrames++;
+    if (slot.kind == SHOP_EXIT) {
+        if (sShopStandFrames == SHOP_EXIT_FRAMES) {
+            Notify("Onward! ");
+            GoToNextFloor(play);
+        }
+    } else if (sShopStandFrames == SHOP_BUY_FRAMES) {
+        BuyShopSlot(play, slot);
+    }
+}
+
 static void OnPlayerUpdateRoguelike() {
     PlayState* play = gPlayState;
     if (play == NULL) {
@@ -3572,9 +3977,15 @@ static void OnPlayerUpdateRoguelike() {
     sRun.stateFrames++;
     UpdateLeveling(play);
     UpdateSwordBeam(play);
+    UpdateFairyCompanion(play);
 
     switch (sRun.roomState) {
         case ROOM_STATE_ENTERING:
+            if (sRun.shop && sRun.stateFrames >= WAVE_SPAWN_DELAY) {
+                SetupShop(play);
+                EnterRoomState(ROOM_STATE_SHOP);
+                break;
+            }
             if (sRun.stateFrames >= WAVE_SPAWN_DELAY) {
                 ApplyRoomRemix(play);
                 if (sRun.miniBoss) {
@@ -3671,6 +4082,10 @@ static void OnPlayerUpdateRoguelike() {
             break;
         }
 
+        case ROOM_STATE_SHOP:
+            UpdateShop(play);
+            break;
+
         case ROOM_STATE_RUN_OVER:
             // Keep Link standing until the run wraps up.
             if (gSaveContext.health <= 0) {
@@ -3702,6 +4117,7 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     sHurtThisRoom = false;
     sFuryKills = 0;
     sOwnChestFlags = 0;
+    ResetFairy();
     sPillars.clear();
     sChallengeActive = false;
     ResetSwordBeam();
@@ -3838,6 +4254,9 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     }
     if (sRun.arena) {
         addTwist("Arena");
+    }
+    if (sRun.shop) {
+        addTwist("Shop");
     }
     if (sRun.modifier != FLOORMOD_NONE) {
         addTwist(sModifierNames[sRun.modifier]);
