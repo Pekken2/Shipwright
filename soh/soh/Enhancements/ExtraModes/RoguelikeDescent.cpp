@@ -49,6 +49,8 @@ extern "C" {
 #include "functions.h"
 #include "variables.h"
 #include "src/overlays/actors/ovl_En_Box/z_en_box.h"
+#include "src/overlays/actors/ovl_En_Arrow/z_en_arrow.h"
+#include "src/overlays/actors/ovl_Arms_Hook/z_arms_hook.h"
 extern PlayState* gPlayState;
 void func_8083DF68(Player* player, f32 arg1, s16 arg2); // Player: steer towards a speed/yaw target
 void func_8083DDC8(Player* player, PlayState* play);
@@ -356,6 +358,20 @@ typedef enum {
     RELIC_LON_LON_MILK,    // heal after every cleared room
     RELIC_MIRROR_SHARD,    // sword beams bounce off walls
     RELIC_FAIRY_FRIEND,    // a fairy companion that attacks enemies
+    RELIC_TRIDENT_CHARM,   // sword beams fire in threes
+    RELIC_HEROS_SPIRIT,    // sword beams pierce
+    RELIC_NAVIS_GUIDANCE,  // sword beams home in
+    RELIC_CHARGED_BEAM,    // spin attacks fire a ring of beams
+    RELIC_SKYWARD_STRIKE,  // jump attacks slam down with a shockwave
+    RELIC_FINISHER_RUNE,   // every fourth hit bursts
+    RELIC_VENGEANCE,       // after being hurt, the next hit triples
+    RELIC_SHATTER,         // frozen enemies take triple damage
+    RELIC_BLAST_ARROWS,    // arrows explode
+    RELIC_EARTHSHAKER,     // hammer swings quake
+    RELIC_GRAPPLING_FANG,  // hookshot hits bite and arc
+    RELIC_FIREBOMBS,       // bombs leave flames
+    RELIC_PARRY_CREST,     // well-timed shield blocks stun and power up
+    RELIC_STEAM_BURST,     // fire + ice on one enemy explodes
     RELIC_COUNT,
 } Relic;
 
@@ -397,11 +413,37 @@ static const RelicInfo sRelicInfo[RELIC_COUNT] = {
     { "Mirror Shard", "Mirror", "Your sword beams bounce off walls twice more and fly farther.", 2, false },
     { "Fairy Friend", "Fairy", "A fairy fights at your side, darting at nearby enemies. More of them, faster.", 3,
       false },
+    { "Trident Charm", "Trident", "Your sword beams fire in threes.", 1, false },
+    { "Hero's Spirit", "Pierce", "Your sword beams pierce through enemies.", 1, false },
+    { "Navi's Guidance", "Homing", "Your sword beams curve towards enemies.", 1, false },
+    { "Charged Beam", "Spin Beam", "Spin attacks fire sword beams in every direction, even when you're hurt.", 1,
+      false },
+    { "Skyward Strike", "Skyward", "Jump attacks slam down with a shockwave.", 1, false },
+    { "Finisher Rune", "Finisher", "Every fourth hit releases a burst that hurts enemies around it.", 1, false },
+    { "Vengeance", "Vengeance", "After you get hurt, your next hit deals triple damage.", 1, false },
+    { "Shatter", "Shatter", "Hits on frozen enemies deal triple damage.", 1, false },
+    { "Blast Arrows", "Blast", "Your arrows explode when they hit.", 1, true },
+    { "Earthshaker", "Quake", "Megaton Hammer swings send out a quake that hurts and stuns.", 1, false },
+    { "Grappling Fang", "Grapple", "Hookshot hits deal heavy damage and arc lightning to enemies nearby.", 1, false },
+    { "Firebombs", "Firebomb", "Bombs leave flames behind that set enemies on fire.", 1, false },
+    { "Parry Crest", "Parry", "Raise your shield just as a hit lands to stun the attacker and power up your next hit.",
+      1, false },
+    { "Steam Burst", "Steam", "An enemy that's burning and frozen at once explodes.", 1, false },
 };
 
 static int sRelics[RELIC_COUNT];
 static bool sHurtThisRoom = false; // Flawless Charm
 static Actor* sFairyTarget = NULL;  // Fairy Friend: the enemy she's darting at
+static bool sParryCrit = false;      // Parry Crest: the next hit is powered up
+static bool sVengeanceReady = false; // Vengeance: the next hit deals triple damage
+static int sFinisherHits = 0;        // Finisher Rune
+
+// Attack upgrade helpers (defined with the sword beam), used by the enemy and damage code.
+static bool AnyShockwaveActive();
+static void SpawnShockwave(PlayState* play, const Vec3f& pos, s16 radius, u32 dmgFlags, u8 damage);
+static void ExplosionAt(PlayState* play, const Vec3f& pos, s16 radius, u8 damage);
+static bool InParryWindow();
+static void DoParry(PlayState* play, Actor* attacker);
 static int sFuryKills = 0;         // Battle Fury: kills since Link was last hurt
 static int sRegenFrames = 0;       // Fairy's Blessing
 static int sBombRegenFrames = 0;   // Blast Pouch
@@ -415,13 +457,14 @@ static bool HasRelic(Relic relic) {
     return sRelics[relic] > 0;
 }
 
+static bool RelicUsable(Relic relic);
+
 // A relic Link can still take more of. Devil deals draw from the strong ones.
 static Relic PickRelic(bool devilDeal, const std::vector<Relic>& exclude) {
     std::vector<Relic> pool;
     for (int r = 0; r < RELIC_COUNT; r++) {
         Relic relic = (Relic)r;
-        if (sRelics[r] >= sRelicInfo[r].maxStacks || (devilDeal && !sRelicInfo[r].devil) ||
-            (relic == RELIC_MIRROR_SHARD && !ROGUELIKE_SWORD_BEAM)) {
+        if (sRelics[r] >= sRelicInfo[r].maxStacks || (devilDeal && !sRelicInfo[r].devil) || !RelicUsable(relic)) {
             continue;
         }
         if (std::find(exclude.begin(), exclude.end(), relic) != exclude.end()) {
@@ -630,6 +673,34 @@ static void GiveOwnedEquip(EquipmentType type, u16 invIndex) {
 
 static bool HasItem(u8 item) {
     return INV_CONTENT(item) == item;
+}
+
+// Relics that need a certain weapon (or the sword beam) are only offered once Link can use them.
+static bool RelicUsable(Relic relic) {
+    bool fire = HasRelic(RELIC_EMBER_EDGE) || sRun.blade == RBLADE_FLAME;
+    bool ice = HasRelic(RELIC_FROSTBITE) || sRun.blade == RBLADE_FROST || HasItem(ITEM_ARROW_ICE);
+    switch (relic) {
+        case RELIC_MIRROR_SHARD:
+        case RELIC_TRIDENT_CHARM:
+        case RELIC_HEROS_SPIRIT:
+        case RELIC_NAVIS_GUIDANCE:
+        case RELIC_CHARGED_BEAM:
+            return ROGUELIKE_SWORD_BEAM;
+        case RELIC_BLAST_ARROWS:
+            return HasItem(ITEM_BOW);
+        case RELIC_EARTHSHAKER:
+            return HasItem(ITEM_HAMMER);
+        case RELIC_GRAPPLING_FANG:
+            return INV_CONTENT(ITEM_HOOKSHOT) != ITEM_NONE;
+        case RELIC_FIREBOMBS:
+            return HasItem(ITEM_BOMB) || HasItem(ITEM_BOMBCHU) || HasRelic(RELIC_BLAST_POUCH);
+        case RELIC_SHATTER:
+            return ice;
+        case RELIC_STEAM_BURST:
+            return fire || ice;
+        default:
+            return true;
+    }
 }
 
 static bool HasBottledFairy() {
@@ -2139,6 +2210,7 @@ typedef struct {
     u8 prevHealth;
     int burnTicks; // Ember Edge: fire damage left to deal
     int burnTimer;
+    int frozenFrames; // frames since it was last frozen (Shatter, Steam Burst)
 } EnemyInfo;
 
 static std::unordered_map<Actor*, EnemyInfo> sEnemies;
@@ -2219,6 +2291,7 @@ static void SetUpEnemy(Actor* actor) {
     info.affix = AFFIX_NONE;
     info.burnTicks = 0;
     info.burnTimer = 0;
+    info.frozenFrames = 0;
 
     int eliteChance = std::min(8 + sRun.floor * 4, 60);
     if (sRun.modifier == FLOORMOD_ELITE) {
@@ -2288,6 +2361,13 @@ static void OnActorUpdateRoguelike(void* refActor) {
     }
     EnemyInfo& info = it->second;
 
+    // Remember a freeze for a moment: the hit that lands on a frozen enemy usually thaws it.
+    if (actor->freezeTimer > 0) {
+        info.frozenFrames = 10;
+    } else if (info.frozenFrames > 0) {
+        info.frozenFrames--;
+    }
+
     // Link's level bonus: when this enemy loses health, take a bit more. Never finishes it off by itself, so the
     // enemy's own death handling always runs from a real hit.
     u8 health = actor->colChkInfo.health;
@@ -2307,6 +2387,32 @@ static void OnActorUpdateRoguelike(void* refActor) {
             sComboHits = sComboFrames <= COMBO_WINDOW ? std::min(sComboHits + 1, 10) : 1;
             sComboFrames = 0;
             bonusPct += 8 * (sComboHits - 1);
+        }
+        // Vengeance and Parry Crest: the next hit after being hurt / a parry is powered up.
+        if (sVengeanceReady) {
+            sVengeanceReady = false;
+            bonusPct += 200;
+            Sfx_PlaySfxCentered(NA_SE_IT_SWORD_STRIKE);
+        }
+        if (sParryCrit) {
+            sParryCrit = false;
+            bonusPct += 150;
+            Sfx_PlaySfxCentered(NA_SE_IT_SWORD_STRIKE);
+        }
+        // Shatter: frozen enemies take triple damage.
+        if (HasRelic(RELIC_SHATTER) && info.frozenFrames > 0) {
+            info.frozenFrames = 0;
+            bonusPct += 200;
+            Sfx_PlaySfxCentered(NA_SE_EV_ICE_BROKEN);
+        }
+        // Finisher Rune: every fourth hit bursts (hits from the bursts themselves don't count).
+        if (HasRelic(RELIC_FINISHER_RUNE) && !AnyShockwaveActive() && ++sFinisherHits >= 4) {
+            sFinisherHits = 0;
+            Vec3f burstPos = actor->world.pos;
+            Vec3f zero = { 0.0f, 0.0f, 0.0f };
+            EffectSsBlast_SpawnWhiteShockwave(play, &burstPos, &zero, &zero);
+            Sfx_PlaySfxCentered(NA_SE_IT_SWORD_STRIKE);
+            SpawnShockwave(play, burstPos, 120, DMG_SLASH_MASTER, 2);
         }
         // Lucky Strike: now and then a hit lands for triple damage.
         if (HasRelic(RELIC_LUCKY_STRIKE) && RandInt(1, 100) <= 12 * RelicCount(RELIC_LUCKY_STRIKE)) {
@@ -2351,6 +2457,7 @@ static void OnActorUpdateRoguelike(void* refActor) {
         if (HasBlade(RBLADE_BLOOD)) {
             ApplyOwnHealthChange(play, 2);
         }
+        // Steam Burst checks after this hit's fire and ice effects (below).
         // Ember Edge: set it on fire.
         if (HasRelic(RELIC_EMBER_EDGE) && info.burnTicks == 0 &&
             RandInt(1, 100) <= std::min(25 * RelicCount(RELIC_EMBER_EDGE), 75)) {
@@ -2365,6 +2472,14 @@ static void OnActorUpdateRoguelike(void* refActor) {
             actor->freezeTimer = 40;
             Actor_SetColorFilter(actor, 0, 255, 0, 40);
             Sfx_PlaySfxCentered(NA_SE_EV_ICE_FREEZE);
+        }
+        // Steam Burst: burning and frozen at once makes it explode.
+        if (HasRelic(RELIC_STEAM_BURST) && info.burnTicks > 0 && (actor->freezeTimer > 0 || info.frozenFrames > 0) &&
+            !AnyShockwaveActive()) {
+            info.burnTicks = 0;
+            info.frozenFrames = 0;
+            actor->freezeTimer = 0;
+            ExplosionAt(play, actor->world.pos, 130, 4);
         }
     }
 
@@ -2384,7 +2499,14 @@ static void OnActorUpdateRoguelike(void* refActor) {
     }
 }
 
+static void AddFirePatch(const Vec3f& pos);
+
 static void OnActorDestroyRoguelike(void* refActor) {
+    Actor* destroyed = (Actor*)refActor;
+    if (sRun.active && HasRelic(RELIC_FIREBOMBS) &&
+        (destroyed->id == ACTOR_EN_BOM || destroyed->id == ACTOR_EN_BOM_CHU)) {
+        AddFirePatch(destroyed->world.pos);
+    }
     sEnemies.erase((Actor*)refActor);
     sMiniBossActors.erase((Actor*)refActor);
     sArenaEnemies.erase(std::remove(sArenaEnemies.begin(), sArenaEnemies.end(), (Actor*)refActor), sArenaEnemies.end());
@@ -2533,6 +2655,13 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
         return;
     }
 
+    // Parry Crest: a hit that lands right after raising the shield is turned away.
+    if (InParryWindow()) {
+        gSaveContext.health = (s16)std::min(gSaveContext.health + taken, (int)gSaveContext.healthCapacity);
+        DoParry(play, NULL);
+        return;
+    }
+
     // Deku Bark: sometimes the hit just bounces off.
     if (HasRelic(RELIC_DEKU_BARK) && RandInt(1, 100) <= std::min(15 * RelicCount(RELIC_DEKU_BARK), 45)) {
         gSaveContext.health = (s16)std::min(gSaveContext.health + taken, (int)gSaveContext.healthCapacity);
@@ -2580,6 +2709,9 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
     }
     sHurtThisRoom = true;
     sFuryKills = 0;
+    if (HasRelic(RELIC_VENGEANCE)) {
+        sVengeanceReady = true;
+    }
     int finalDamage = std::max(1, (int)lroundf(scaled));
     int delta = finalDamage - taken; // positive: extra damage, negative: damage refunded
     gSaveContext.health = (s16)std::clamp(gSaveContext.health - delta, -1, (int)gSaveContext.healthCapacity);
@@ -3055,6 +3187,8 @@ static void ResetRunState() {
     sRun.tunic = RTUNIC_NONE;
     sRun.blade = RBLADE_NONE;
     sRun.shop = false;
+    sVengeanceReady = false;
+    sParryCrit = false;
     sThunderHits = 0;
     sComboHits = 0;
     sComboFrames = COMBO_WINDOW + 1;
@@ -3399,7 +3533,8 @@ static void OnChestInitRoguelike(void* actorPtr) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Sword beam: at full health, a sword swing also fires a beam (one on screen at a time)
+// Sword beams: at full health a sword swing also fires a beam (one volley at a time). Relics add more beams, piercing,
+// homing, bouncing (Mirror Shard) and a spin-attack ring.
 // ---------------------------------------------------------------------------------------------------------------------
 
 static ColliderCylinderInit sBeamColliderInit = {
@@ -3409,34 +3544,49 @@ static ColliderCylinderInit sBeamColliderInit = {
     { 18, 30, -15, { 0, 0, 0 } },
 };
 
-static ColliderCylinder sBeamCollider;
-static Actor* sBeamColliderOwner = NULL; // the collider belongs to Link; set up again whenever Link is a new actor
-static bool sBeamActive = false;
-static Vec3f sBeamPos;
-static Vec3f sBeamVel;
-static int sBeamLife = 0;
-static int sBeamBounces = 0; // Mirror Shard: wall bounces left
+typedef struct {
+    bool active;
+    Vec3f pos;
+    Vec3f vel;
+    int life;
+    int bounces; // Mirror Shard: wall bounces left
+    bool pierce; // Hero's Spirit
+    bool homing; // Navi's Guidance
+    ColliderCylinder collider;
+} SwordBeam;
+
+static constexpr int MAX_BEAMS = 12;
+static SwordBeam sBeams[MAX_BEAMS];
 static s8 sPrevMeleeState = 0;
 static constexpr f32 BEAM_SPEED = 24.0f;
 static constexpr int BEAM_LIFE = 22;
 
-static void EndSwordBeam(PlayState* play, bool burst) {
-    if (sBeamActive && burst) {
-        Vec3f zero = { 0.0f, 0.0f, 0.0f };
-        Color_RGBA8 prim = { 255, 255, 255, 255 };
-        Color_RGBA8 env = { 120, 200, 255, 255 };
-        for (int i = 0; i < 6; i++) {
-            Vec3f vel = { RandFloat(-3.0f, 3.0f), RandFloat(-1.0f, 3.0f), RandFloat(-3.0f, 3.0f) };
-            EffectSsKiraKira_SpawnDispersed(play, &sBeamPos, &vel, &zero, &prim, &env, 2000, 8);
+static void ResetAttackUpgrades();
+
+static bool AnyBeamActive() {
+    for (const SwordBeam& beam : sBeams) {
+        if (beam.active) {
+            return true;
         }
     }
-    sBeamActive = false;
+    return false;
+}
+
+static void SparkleBurst(PlayState* play, const Vec3f& pos, Color_RGBA8 env, int count) {
+    Vec3f zero = { 0.0f, 0.0f, 0.0f };
+    Color_RGBA8 prim = { 255, 255, 255, 255 };
+    for (int i = 0; i < count; i++) {
+        Vec3f vel = { RandFloat(-3.0f, 3.0f), RandFloat(-1.0f, 3.0f), RandFloat(-3.0f, 3.0f) };
+        EffectSsKiraKira_SpawnDispersed(play, (Vec3f*)&pos, &vel, &zero, &prim, &env, 2000, 8);
+    }
 }
 
 static void ResetSwordBeam() {
-    sBeamActive = false;
-    sBeamColliderOwner = NULL;
+    for (SwordBeam& beam : sBeams) {
+        beam.active = false;
+    }
     sPrevMeleeState = 0;
+    ResetAttackUpgrades();
 }
 
 static bool HoldingSword(Player* player) {
@@ -3444,99 +3594,427 @@ static bool HoldingSword(Player* player) {
            player->heldItemAction == PLAYER_IA_SWORD_BIGGORON;
 }
 
-static void UpdateSwordBeam(PlayState* play) {
-    Player* player = GET_PLAYER(play);
-    if (player == NULL) {
-        return;
-    }
-    if (sBeamColliderOwner != &player->actor) {
-        Collider_InitCylinder(play, &sBeamCollider);
-        Collider_SetCylinder(play, &sBeamCollider, &player->actor, &sBeamColliderInit);
-        sBeamColliderOwner = &player->actor;
-        sBeamActive = false;
-    }
-
-    // A new swing starts when the sword's attack state switches on.
-    s8 meleeState = player->meleeWeaponState;
-    bool swingStarted = meleeState != 0 && sPrevMeleeState == 0;
-    sPrevMeleeState = meleeState;
-
-    if (swingStarted && !sBeamActive && ROGUELIKE_SWORD_BEAM && HoldingSword(player) &&
-        gSaveContext.health >= gSaveContext.healthCapacity && gSaveContext.health > 0) {
-        s16 yaw = player->actor.shape.rot.y;
+static void FireBeam(PlayState* play, Player* player, s16 yaw) {
+    for (SwordBeam& beam : sBeams) {
+        if (beam.active) {
+            continue;
+        }
+        Collider_InitCylinder(play, &beam.collider);
+        Collider_SetCylinder(play, &beam.collider, &player->actor, &sBeamColliderInit);
         f32 fwdX = Math_SinS(yaw);
         f32 fwdZ = Math_CosS(yaw);
-        sBeamPos = { player->actor.world.pos.x + fwdX * 30.0f, player->actor.world.pos.y + 35.0f,
+        beam.pos = { player->actor.world.pos.x + fwdX * 30.0f, player->actor.world.pos.y + 35.0f,
                      player->actor.world.pos.z + fwdZ * 30.0f };
-        sBeamVel = { fwdX * BEAM_SPEED, 0.0f, fwdZ * BEAM_SPEED };
-        sBeamLife = BEAM_LIFE + 10 * RelicCount(RELIC_MIRROR_SHARD);
-        sBeamBounces = 2 * RelicCount(RELIC_MIRROR_SHARD);
-        sBeamActive = true;
-        sBeamCollider.base.atFlags &= ~AT_HIT;
-        Sfx_PlaySfxCentered(NA_SE_IT_SWORD_SWING_HARD);
+        beam.vel = { fwdX * BEAM_SPEED, 0.0f, fwdZ * BEAM_SPEED };
+        beam.life = BEAM_LIFE + 10 * RelicCount(RELIC_MIRROR_SHARD);
+        beam.bounces = 2 * RelicCount(RELIC_MIRROR_SHARD);
+        beam.pierce = HasRelic(RELIC_HEROS_SPIRIT);
+        beam.homing = HasRelic(RELIC_NAVIS_GUIDANCE);
+        beam.active = true;
+        return;
     }
+}
 
-    if (!sBeamActive) {
+static Actor* FindNearestEnemy(PlayState* play, const Vec3f& pos, f32 range) {
+    Actor* best = NULL;
+    f32 bestDist = range;
+    for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; actor != NULL; actor = actor->next) {
+        if (actor->update == NULL || actor->colChkInfo.health == 0 || EnemyNeedsMissingGear(actor)) {
+            continue;
+        }
+        f32 dist = Math_Vec3f_DistXYZ((Vec3f*)&pos, &actor->focus.pos);
+        if (dist < bestDist) {
+            best = actor;
+            bestDist = dist;
+        }
+    }
+    return best;
+}
+
+static void UpdateBeam(PlayState* play, SwordBeam& beam) {
+    Color_RGBA8 burstColor = { 120, 200, 255, 255 };
+    if (beam.collider.base.atFlags & AT_HIT) {
+        beam.collider.base.atFlags &= ~AT_HIT;
+        if (!beam.pierce) {
+            SparkleBurst(play, beam.pos, burstColor, 6);
+            beam.active = false;
+            return;
+        }
+    }
+    if (--beam.life <= 0) {
+        SparkleBurst(play, beam.pos, burstColor, 6);
+        beam.active = false;
         return;
     }
 
-    // Hit something last frame: it's spent.
-    if (sBeamCollider.base.atFlags & AT_HIT) {
-        sBeamCollider.base.atFlags &= ~AT_HIT;
-        EndSwordBeam(play, true);
-        return;
-    }
-    if (--sBeamLife <= 0) {
-        EndSwordBeam(play, true);
-        return;
+    // Navi's Guidance: steer towards the nearest enemy.
+    if (beam.homing) {
+        Actor* target = FindNearestEnemy(play, beam.pos, 320.0f);
+        if (target != NULL) {
+            Vec3f want = { target->focus.pos.x - beam.pos.x, target->focus.pos.y - beam.pos.y,
+                           target->focus.pos.z - beam.pos.z };
+            f32 len = sqrtf(want.x * want.x + want.y * want.y + want.z * want.z);
+            if (len > 1.0f) {
+                beam.vel.x += (want.x / len * BEAM_SPEED - beam.vel.x) * 0.25f;
+                beam.vel.y += (want.y / len * BEAM_SPEED - beam.vel.y) * 0.25f;
+                beam.vel.z += (want.z / len * BEAM_SPEED - beam.vel.z) * 0.25f;
+                f32 speed = sqrtf(beam.vel.x * beam.vel.x + beam.vel.y * beam.vel.y + beam.vel.z * beam.vel.z);
+                if (speed > 0.1f) {
+                    beam.vel.x *= BEAM_SPEED / speed;
+                    beam.vel.y *= BEAM_SPEED / speed;
+                    beam.vel.z *= BEAM_SPEED / speed;
+                }
+            }
+        }
     }
 
-    // Move, stopping at walls.
-    Vec3f next = { sBeamPos.x + sBeamVel.x, sBeamPos.y + sBeamVel.y, sBeamPos.z + sBeamVel.z };
+    // Move, stopping at walls (or bouncing off them with Mirror Shard).
+    Vec3f next = { beam.pos.x + beam.vel.x, beam.pos.y + beam.vel.y, beam.pos.z + beam.vel.z };
     Vec3f wallHit;
     CollisionPoly* wallPoly = NULL;
     s32 bgId;
-    if (BgCheck_EntityLineTest1(&play->colCtx, &sBeamPos, &next, &wallHit, &wallPoly, true, false, false, true,
-                                &bgId)) {
+    if (BgCheck_EntityLineTest1(&play->colCtx, &beam.pos, &next, &wallHit, &wallPoly, true, true, true, true, &bgId)) {
         CheckBeamHitPillar(play, bgId);
-        if (sBeamBounces > 0 && wallPoly != NULL) {
-            // Mirror Shard: reflect off the wall (flat, along the ground) and keep going.
+        if (beam.bounces > 0 && wallPoly != NULL) {
             f32 nx = COLPOLY_GET_NORMAL(wallPoly->normal.x);
             f32 nz = COLPOLY_GET_NORMAL(wallPoly->normal.z);
             f32 len = sqrtf(nx * nx + nz * nz);
             if (len > 0.1f) {
                 nx /= len;
                 nz /= len;
-                f32 dot = sBeamVel.x * nx + sBeamVel.z * nz;
-                sBeamVel.x -= 2.0f * dot * nx;
-                sBeamVel.z -= 2.0f * dot * nz;
-                // Step back off the wall so the next move starts clear of it.
-                sBeamPos = { wallHit.x + nx * 4.0f, sBeamPos.y, wallHit.z + nz * 4.0f };
-                sBeamBounces--;
+                f32 dot = beam.vel.x * nx + beam.vel.z * nz;
+                beam.vel.x -= 2.0f * dot * nx;
+                beam.vel.z -= 2.0f * dot * nz;
+                beam.vel.y = 0.0f;
+                beam.pos = { wallHit.x + nx * 4.0f, beam.pos.y, wallHit.z + nz * 4.0f };
+                beam.bounces--;
                 Sfx_PlaySfxCentered(NA_SE_IT_SHIELD_REFLECT_SW);
                 return;
             }
         }
-        sBeamPos = wallHit;
-        EndSwordBeam(play, true);
+        beam.pos = wallHit;
+        SparkleBurst(play, beam.pos, burstColor, 6);
+        beam.active = false;
         return;
     }
-    sBeamPos = next;
+    beam.pos = next;
 
-    // The beam itself: a bright streak of sparkles.
+    // The beam itself: a bright streak of sparkles (gold when it pierces).
     Vec3f zero = { 0.0f, 0.0f, 0.0f };
     Color_RGBA8 prim = { 255, 255, 255, 255 };
-    Color_RGBA8 env = { 100, 180, 255, 255 };
+    Color_RGBA8 env = beam.pierce ? Color_RGBA8{ 255, 210, 80, 255 } : Color_RGBA8{ 100, 180, 255, 255 };
     for (int i = 0; i < 3; i++) {
-        Vec3f sparkPos = { sBeamPos.x - sBeamVel.x * (i / 3.0f), sBeamPos.y, sBeamPos.z - sBeamVel.z * (i / 3.0f) };
+        Vec3f sparkPos = { beam.pos.x - beam.vel.x * (i / 3.0f), beam.pos.y - beam.vel.y * (i / 3.0f),
+                           beam.pos.z - beam.vel.z * (i / 3.0f) };
         EffectSsKiraKira_SpawnDispersed(play, &sparkPos, &zero, &zero, &prim, &env, 2500, 5);
     }
 
-    // Damage whatever it touches, the same way a sword swing would.
-    sBeamCollider.dim.pos.x = (s16)sBeamPos.x;
-    sBeamCollider.dim.pos.y = (s16)sBeamPos.y;
-    sBeamCollider.dim.pos.z = (s16)sBeamPos.z;
-    CollisionCheck_SetAT(play, &play->colChkCtx, &sBeamCollider.base);
+    beam.collider.dim.pos.x = (s16)beam.pos.x;
+    beam.collider.dim.pos.y = (s16)beam.pos.y;
+    beam.collider.dim.pos.z = (s16)beam.pos.z;
+    CollisionCheck_SetAT(play, &play->colChkCtx, &beam.collider.base);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Shockwaves: short-lived damage zones on Link's side, used by several attack upgrades (quakes, bursts, explosions).
+// ---------------------------------------------------------------------------------------------------------------------
+
+static ColliderCylinderInit sShockwaveInit = {
+    { COLTYPE_NONE, AT_ON | AT_TYPE_PLAYER, AC_NONE, OC1_NONE, OC2_NONE, COLSHAPE_CYLINDER },
+    { ELEMTYPE_UNK2, { DMG_SLASH_MASTER, 0x00, 0x02 }, { 0x00000000, 0x00, 0x00 }, TOUCH_ON | TOUCH_SFX_NONE,
+      BUMP_NONE, OCELEM_NONE },
+    { 100, 80, -30, { 0, 0, 0 } },
+};
+
+typedef struct {
+    bool active;
+    int frames;
+    ColliderCylinder collider;
+} Shockwave;
+
+static Shockwave sShockwaves[8];
+
+static bool AnyShockwaveActive() {
+    for (const Shockwave& wave : sShockwaves) {
+        if (wave.active) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void SpawnShockwave(PlayState* play, const Vec3f& pos, s16 radius, u32 dmgFlags, u8 damage) {
+    Player* player = GET_PLAYER(play);
+    for (Shockwave& wave : sShockwaves) {
+        if (wave.active) {
+            continue;
+        }
+        Collider_InitCylinder(play, &wave.collider);
+        Collider_SetCylinder(play, &wave.collider, &player->actor, &sShockwaveInit);
+        wave.collider.info.toucher.dmgFlags = dmgFlags;
+        wave.collider.info.toucher.damage = damage;
+        wave.collider.dim.radius = radius;
+        wave.collider.dim.pos.x = (s16)pos.x;
+        wave.collider.dim.pos.y = (s16)pos.y;
+        wave.collider.dim.pos.z = (s16)pos.z;
+        wave.frames = 3;
+        wave.active = true;
+        return;
+    }
+}
+
+static void UpdateShockwaves(PlayState* play) {
+    for (Shockwave& wave : sShockwaves) {
+        if (!wave.active) {
+            continue;
+        }
+        CollisionCheck_SetAT(play, &play->colChkCtx, &wave.collider.base);
+        if (--wave.frames <= 0) {
+            wave.active = false;
+        }
+    }
+}
+
+static void ExplosionAt(PlayState* play, const Vec3f& pos, s16 radius, u8 damage) {
+    Vec3f zero = { 0.0f, 0.0f, 0.0f };
+    Vec3f blastPos = pos;
+    blastPos.y += 10.0f;
+    EffectSsBomb2_SpawnLayered(play, &blastPos, &zero, &zero, 100, 19);
+    Sfx_PlaySfxCentered(NA_SE_IT_BOMB_EXPLOSION);
+    SpawnShockwave(play, pos, radius, DMG_EXPLOSIVE, damage);
+}
+
+static void QuakeAt(PlayState* play, const Vec3f& pos, s16 radius, u32 dmgFlags, u8 damage) {
+    Vec3f zero = { 0.0f, 0.0f, 0.0f };
+    Vec3f ringPos = pos;
+    ringPos.y += 5.0f;
+    EffectSsBlast_SpawnWhiteShockwave(play, &ringPos, &zero, &zero);
+    Actor_RequestQuake(play, 4, 8);
+    Sfx_PlaySfxCentered(NA_SE_IT_HAMMER_HIT);
+    SpawnShockwave(play, pos, radius, dmgFlags, damage);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Attack upgrades that watch Link's moves: Skyward Strike, Earthshaker, Parry Crest, Blast Arrows, Grappling Fang and
+// Firebombs. (Finisher Rune, Vengeance, Shatter and Steam Burst work on hits, in the enemy update.)
+// ---------------------------------------------------------------------------------------------------------------------
+
+static bool sSkywardPending = false; // a jump attack is in the air
+static int sSkywardFrames = 0;
+static int sHammerDelay = 0;         // Earthshaker: frames until the quake hits
+static int sShieldFrames = 0;        // how long the shield has been up (0 = down)
+static int sParryCooldown = 0;
+static int sFangCooldown = 0;        // Grappling Fang
+
+typedef struct {
+    Vec3f pos;
+    int frames;
+} FirePatch;
+static std::vector<FirePatch> sFirePatches; // Firebombs
+
+static void ResetAttackUpgrades() {
+    sSkywardPending = false;
+    sHammerDelay = 0;
+    sShieldFrames = 0;
+    sParryCooldown = 0;
+    sFinisherHits = 0;
+    sFangCooldown = 0;
+    sFirePatches.clear();
+    for (Shockwave& wave : sShockwaves) {
+        wave.active = false;
+    }
+}
+
+static void AddFirePatch(const Vec3f& pos) {
+    if (sFirePatches.size() < 6) {
+        sFirePatches.push_back({ pos, 5 * FRAMES_PER_SECOND });
+    }
+}
+
+// Parry Crest: stun whoever was blocked and power up Link's next hit.
+static void DoParry(PlayState* play, Actor* attacker) {
+    Player* player = GET_PLAYER(play);
+    if (attacker == NULL || attacker->category != ACTORCAT_ENEMY) {
+        attacker = FindNearestEnemy(play, player->actor.world.pos, 150.0f);
+    }
+    if (attacker != NULL && attacker->update != NULL) {
+        attacker->freezeTimer = 30;
+        Actor_SetColorFilter(attacker, 0, 150, 0, 30);
+    }
+    Vec3f shieldPos = player->actor.world.pos;
+    shieldPos.y += 40.0f;
+    SparkleBurst(play, shieldPos, Color_RGBA8{ 255, 255, 160, 255 }, 8);
+    Sfx_PlaySfxCentered(NA_SE_IT_SHIELD_REFLECT_SW);
+    sParryCrit = true;
+    sParryCooldown = FRAMES_PER_SECOND;
+}
+
+// True if a hit landing right now should count as parried (the shield went up just before it).
+static bool InParryWindow() {
+    return HasRelic(RELIC_PARRY_CREST) && sShieldFrames > 0 && sShieldFrames <= 10 && sParryCooldown == 0;
+}
+
+static void UpdateAttackUpgrades(PlayState* play, Player* player, bool swingStarted) {
+    if (sParryCooldown > 0) {
+        sParryCooldown--;
+    }
+    if (sFangCooldown > 0) {
+        sFangCooldown--;
+    }
+    s8 mwa = player->meleeWeaponAnimation;
+
+    // Skyward Strike: a jump attack slams down with a shockwave when Link lands.
+    if (HasRelic(RELIC_SKYWARD_STRIKE) && swingStarted &&
+        (mwa == PLAYER_MWA_JUMPSLASH_START || mwa == PLAYER_MWA_FLIPSLASH_START)) {
+        sSkywardPending = true;
+        sSkywardFrames = 0;
+    }
+    if (sSkywardPending) {
+        sSkywardFrames++;
+        if (sSkywardFrames > 3 && (player->actor.bgCheckFlags & BGCHECKFLAG_GROUND)) {
+            sSkywardPending = false;
+            f32 fwdX = Math_SinS(player->actor.shape.rot.y);
+            f32 fwdZ = Math_CosS(player->actor.shape.rot.y);
+            Vec3f slam = { player->actor.world.pos.x + fwdX * 40.0f, player->actor.world.pos.y,
+                           player->actor.world.pos.z + fwdZ * 40.0f };
+            QuakeAt(play, slam, 140, DMG_JUMP_MASTER, 4);
+        } else if (sSkywardFrames > 2 * FRAMES_PER_SECOND) {
+            sSkywardPending = false;
+        }
+    }
+
+    // Earthshaker: the hammer hits the ground a moment into the swing.
+    if (HasRelic(RELIC_EARTHSHAKER) && swingStarted && player->heldItemAction == PLAYER_IA_HAMMER) {
+        sHammerDelay = 6;
+    }
+    if (sHammerDelay > 0 && --sHammerDelay == 0) {
+        f32 fwdX = Math_SinS(player->actor.shape.rot.y);
+        f32 fwdZ = Math_CosS(player->actor.shape.rot.y);
+        Vec3f slam = { player->actor.world.pos.x + fwdX * 50.0f, player->actor.world.pos.y,
+                       player->actor.world.pos.z + fwdZ * 50.0f };
+        QuakeAt(play, slam, 170, DMG_HAMMER_SWING, 4);
+    }
+
+    // Parry Crest: track how long the shield has been up, and catch blocks made right after raising it.
+    if (player->stateFlags1 & PLAYER_STATE1_SHIELDING) {
+        sShieldFrames++;
+    } else {
+        sShieldFrames = 0;
+    }
+    if (InParryWindow() && (player->shieldQuad.base.acFlags & AC_HIT)) {
+        DoParry(play, player->shieldQuad.base.ac);
+    }
+
+    // Blast Arrows: fired arrows blow up when they hit something.
+    if (HasRelic(RELIC_BLAST_ARROWS)) {
+        for (Actor* item = play->actorCtx.actorLists[ACTORCAT_ITEMACTION].head; item != NULL; item = item->next) {
+            if (item->id != ACTOR_EN_ARROW || item->parent != NULL || item->params >= ARROW_SEED ||
+                item->params < ARROW_NORMAL_SILENT || item->update == NULL) {
+                continue;
+            }
+            EnArrow* arrow = (EnArrow*)item;
+            if ((arrow->collider.base.atFlags & AT_HIT) || arrow->touchedPoly) {
+                ExplosionAt(play, item->world.pos, 110, 4);
+                Actor_Kill(item);
+            }
+        }
+    }
+
+    // Grappling Fang: a hookshot hit on an enemy bites hard and arcs to others nearby.
+    if (HasRelic(RELIC_GRAPPLING_FANG) && sFangCooldown == 0 && player->heldActor != NULL &&
+        player->heldActor->id == ACTOR_ARMS_HOOK) {
+        ArmsHook* hook = (ArmsHook*)player->heldActor;
+        Actor* bitten = hook->collider.base.at;
+        if ((hook->collider.base.atFlags & AT_HIT) && bitten != NULL && bitten->category == ACTORCAT_ENEMY &&
+            bitten->update != NULL) {
+            sFangCooldown = 15;
+            Sfx_PlaySfxCentered(NA_SE_EN_BIRI_SPARK);
+            for (auto& [enemy, info] : sEnemies) {
+                if (enemy->update == NULL || enemy->colChkInfo.health <= 1) {
+                    continue;
+                }
+                bool isTarget = enemy == bitten;
+                if (!isTarget && Math_Vec3f_DistXYZ(&enemy->world.pos, &bitten->world.pos) > 220.0f) {
+                    continue;
+                }
+                int damage = isTarget ? 6 : 3;
+                enemy->colChkInfo.health = (u8)std::max(1, (int)enemy->colChkInfo.health - damage);
+                info.prevHealth = enemy->colChkInfo.health;
+                Actor_SetColorFilter(enemy, 0, 255, 0, 12);
+            }
+        }
+    }
+
+    // Firebombs: the flames left by bombs set enemies standing in them on fire.
+    for (size_t i = 0; i < sFirePatches.size();) {
+        FirePatch& patch = sFirePatches[i];
+        if (patch.frames % 6 == 0) {
+            Vec3f zero = { 0.0f, 0.0f, 0.0f };
+            Vec3f vel = { 0.0f, 1.0f, 0.0f };
+            Vec3f flamePos = { patch.pos.x + RandFloat(-60.0f, 60.0f), patch.pos.y,
+                               patch.pos.z + RandFloat(-60.0f, 60.0f) };
+            EffectSsKFire_Spawn(play, &flamePos, &vel, &zero, 40, 0);
+        }
+        if (patch.frames % 10 == 0) {
+            for (auto& [enemy, info] : sEnemies) {
+                if (enemy->update != NULL && info.burnTicks == 0 &&
+                    Math_Vec3f_DistXZ(&enemy->world.pos, &patch.pos) < 90.0f &&
+                    fabsf(enemy->world.pos.y - patch.pos.y) < 80.0f) {
+                    info.burnTicks = 4;
+                    info.burnTimer = FRAMES_PER_SECOND;
+                    Actor_SetColorFilter(enemy, 0x4000, 255, 0, 10);
+                }
+            }
+        }
+        if (--patch.frames <= 0) {
+            sFirePatches.erase(sFirePatches.begin() + i);
+        } else {
+            i++;
+        }
+    }
+
+    UpdateShockwaves(play);
+}
+
+static void UpdateSwordBeam(PlayState* play) {
+    Player* player = GET_PLAYER(play);
+    if (player == NULL) {
+        return;
+    }
+
+    // A new swing starts when the weapon's attack state switches on.
+    s8 meleeState = player->meleeWeaponState;
+    bool swingStarted = meleeState != 0 && sPrevMeleeState == 0;
+    sPrevMeleeState = meleeState;
+
+    if (swingStarted && HoldingSword(player) && ROGUELIKE_SWORD_BEAM) {
+        s8 mwa = player->meleeWeaponAnimation;
+        bool spin = mwa >= PLAYER_MWA_SPIN_ATTACK_1H && mwa <= PLAYER_MWA_BIG_SPIN_2H;
+        s16 yaw = player->actor.shape.rot.y;
+        if (spin && HasRelic(RELIC_CHARGED_BEAM)) {
+            // Charged Beam: a ring of beams, at any health.
+            for (int i = 0; i < 8; i++) {
+                FireBeam(play, player, (s16)(yaw + i * 0x2000));
+            }
+            Sfx_PlaySfxCentered(NA_SE_IT_SWORD_SWING_HARD);
+        } else if (!AnyBeamActive() && gSaveContext.health >= gSaveContext.healthCapacity &&
+                   gSaveContext.health > 0) {
+            FireBeam(play, player, yaw);
+            if (HasRelic(RELIC_TRIDENT_CHARM)) {
+                FireBeam(play, player, (s16)(yaw + 0x1000));
+                FireBeam(play, player, (s16)(yaw - 0x1000));
+            }
+            Sfx_PlaySfxCentered(NA_SE_IT_SWORD_SWING_HARD);
+        }
+    }
+
+    for (SwordBeam& beam : sBeams) {
+        if (beam.active) {
+            UpdateBeam(play, beam);
+        }
+    }
+
+    UpdateAttackUpgrades(play, player, swingStarted);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
