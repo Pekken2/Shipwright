@@ -302,6 +302,13 @@ static struct {
 
 static std::vector<Actor*> sArenaEnemies; // on arena floors only the enemies we spawned have to be beaten
 
+// The Dark Link loadout (unlocked by beating the Dark Link mini-boss).
+static constexpr int LOADOUT_DARK_LINK = 5;
+#define ROGUELIKE_DARK_LINK_UNLOCKED_CVAR CVAR_ROGUELIKE("DarkLinkUnlocked")
+static bool IsDarkLink() {
+    return sRun.active && sRun.loadout == LOADOUT_DARK_LINK;
+}
+
 static SaveContext sSnapshot;
 static ReturnPoint sReturnPoint;
 
@@ -707,6 +714,8 @@ static bool RelicUsable(Relic relic) {
             return INV_CONTENT(ITEM_HOOKSHOT) != ITEM_NONE;
         case RELIC_FIREBOMBS:
             return HasItem(ITEM_BOMB) || HasItem(ITEM_BOMBCHU) || HasRelic(RELIC_BLAST_POUCH);
+        case RELIC_PARRY_CREST:
+            return CUR_EQUIP_VALUE(EQUIP_TYPE_SHIELD) != EQUIP_VALUE_SHIELD_NONE;
         case RELIC_SHATTER:
             return ice;
         case RELIC_STEAM_BURST:
@@ -2520,6 +2529,10 @@ static void OnActorUpdateRoguelike(void* refActor) {
         if (HasBlade(RBLADE_BLOOD)) {
             ApplyOwnHealthChange(play, 2);
         }
+        // Dark Link: his shadow blade drinks a little life from every hit.
+        if (IsDarkLink()) {
+            ApplyOwnHealthChange(play, 2);
+        }
         // Steam Burst checks after this hit's fire and ice effects (below).
         // Ember Edge: set it on fire.
         if (HasRelic(RELIC_EMBER_EDGE) && info.burnTicks == 0 &&
@@ -2827,6 +2840,9 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
     }
     if (sRun.bossFloor && sRun.championAffix != 0) {
         scaled *= 1.25f; // champion bosses hit harder
+    }
+    if (IsDarkLink()) {
+        scaled *= 1.25f; // a shadow is fragile
     }
     sHurtThisRoom = true;
     sFuryKills = 0;
@@ -3355,8 +3371,16 @@ typedef struct {
 } LoadoutInfo;
 
 static const LoadoutInfo sLoadouts[] = {
-    { "Hero", 0 }, { "Archer", 5 }, { "Goron Warrior", 8 }, { "Sheikah", 12 }, { "Zora Scout", 15 },
+    { "Hero", 0 },    { "Archer", 5 },     { "Goron Warrior", 8 },
+    { "Sheikah", 12 }, { "Zora Scout", 15 }, { "Dark Link", -1 }, // -1: unlocked by beating the Dark Link mini-boss
 };
+
+static bool LoadoutUnlocked(int choice) {
+    if (sLoadouts[choice].unlockFloor < 0) {
+        return CVarGetInteger(ROGUELIKE_DARK_LINK_UNLOCKED_CVAR, 0) != 0;
+    }
+    return sLoadouts[choice].unlockFloor <= CVarGetInteger(ROGUELIKE_BEST_FLOOR_CVAR, 0);
+}
 
 static bool sDailyRequested = false;
 
@@ -3384,7 +3408,7 @@ static void ChangeStartingHearts(int hearts) {
 
 static void ApplyLoadoutExtras(PlayState* play) {
     int choice = sRun.daily ? 0 : std::clamp(ROGUELIKE_LOADOUT, 0, (int)ARRAY_COUNT(sLoadouts) - 1);
-    if (sLoadouts[choice].unlockFloor > CVarGetInteger(ROGUELIKE_BEST_FLOOR_CVAR, 0)) {
+    if (!LoadoutUnlocked(choice)) {
         choice = 0; // not unlocked yet
     }
     sRun.loadout = choice;
@@ -3417,6 +3441,15 @@ static void ApplyLoadoutExtras(PlayState* play) {
             PutOnCButton(play, ITEM_DINS_FIRE);
             PutOnTunic(play, RTUNIC_SHADOW);
             ChangeStartingHearts(-1);
+            break;
+        case LOADOUT_DARK_LINK: // the Master Sword and no shield (he dodges), two hearts fewer
+            GiveOwnedEquip(EQUIP_TYPE_SWORD, EQUIP_INV_SWORD_MASTER);
+            gSaveContext.equips.buttonItems[0] = ITEM_SWORD_MASTER;
+            SetEquipValue(EQUIP_TYPE_SWORD, EQUIP_VALUE_SWORD_MASTER);
+            gSaveContext.inventory.equipment &= ~OWNED_EQUIP_FLAG(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_DEKU);
+            SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_NONE);
+            gSaveContext.adultEquips = gSaveContext.equips;
+            ChangeStartingHearts(-2);
             break;
         case 4: // Zora Scout: Hookshot, the Zora Tunic, Swift Tunic and a Fairy Friend
             INV_CONTENT(ITEM_HOOKSHOT) = ITEM_HOOKSHOT;
@@ -3783,6 +3816,12 @@ static void OnRoomCleared(PlayState* play, bool timedOut) {
 // The boss is down and its death scene is over: big rewards, then the usual pick of three.
 static void OnBossCleared(PlayState* play) {
     EnterRoomState(ROOM_STATE_CLEARED);
+    if (sRun.miniBoss && std::string(sMiniBossSets[sRun.miniBossSet].name) == "Dark Link" &&
+        !CVarGetInteger(ROGUELIKE_DARK_LINK_UNLOCKED_CVAR, 0)) {
+        CVarSetInteger(ROGUELIKE_DARK_LINK_UNLOCKED_CVAR, 1);
+        Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
+        Notify("Dark Link unlocked! ", "Pick him as your Starting Loadout in the Roguelike Descent menu.");
+    }
     SaveBestFloor(sRun.floor);
     sRun.chestFlag = CHEST_NONE;
 
@@ -4299,11 +4338,71 @@ static void UpdateAttackUpgrades(PlayState* play, Player* player, bool swingStar
     UpdateShockwaves(play);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Dark Link: drawn as a shadow, with a dark shimmer, and Mirror Step (dodging leaves a shadow that bursts).
+// ---------------------------------------------------------------------------------------------------------------------
+
+static bool sDodgeAirborne = false;
+static int sMirrorStepDelay = 0;
+static int sMirrorStepCooldown = 0;
+static Vec3f sMirrorStepPos;
+
+static void UpdateDarkLink(PlayState* play, Player* player) {
+    if (!IsDarkLink()) {
+        return;
+    }
+
+    // The shadow look: a dark grey tint on Link, refreshed every frame. Set directly (Actor_SetColorFilter would also
+    // play the light-arrow hit sound for this tint).
+    player->actor.colorFilterParams = 0x8000 | ((16 & 0xF8) << 5) | 8;
+    player->actor.colorFilterTimer = 8;
+
+    Vec3f zero = { 0.0f, 0.0f, 0.0f };
+    Color_RGBA8 prim = { 60, 40, 80, 255 };
+    Color_RGBA8 env = { 20, 0, 40, 255 };
+    if (player->actor.speedXZ > 3.0f && sRun.frames % 4 == 0) {
+        Vec3f trail = { player->actor.world.pos.x + RandFloat(-10.0f, 10.0f), player->actor.world.pos.y + 25.0f,
+                        player->actor.world.pos.z + RandFloat(-10.0f, 10.0f) };
+        Vec3f up = { 0.0f, 0.8f, 0.0f };
+        EffectSsKiraKira_SpawnDispersed(play, &trail, &up, &zero, &prim, &env, 2600, 14);
+    }
+
+    // Mirror Step: a backflip or sidehop (leaving the ground while Z-targeting, not attacking) leaves a shadow that
+    // bursts a moment later.
+    if (sMirrorStepCooldown > 0) {
+        sMirrorStepCooldown--;
+    }
+    bool onGround = (player->actor.bgCheckFlags & BGCHECKFLAG_GROUND) != 0;
+    bool targeting = (player->stateFlags1 & (PLAYER_STATE1_HOSTILE_LOCK_ON | PLAYER_STATE1_PARALLEL)) != 0;
+    if (!onGround && !sDodgeAirborne && targeting && player->meleeWeaponState == 0 && sMirrorStepCooldown == 0 &&
+        player->actor.velocity.y > 0.0f) {
+        sMirrorStepPos = player->actor.world.pos;
+        sMirrorStepDelay = 8;
+        sMirrorStepCooldown = FRAMES_PER_SECOND;
+        Vec3f shadow = sMirrorStepPos;
+        shadow.y += 30.0f;
+        SparkleBurst(play, shadow, env, 8);
+    }
+    sDodgeAirborne = !onGround;
+
+    if (sMirrorStepDelay > 0 && --sMirrorStepDelay == 0) {
+        Vec3f ringPos = sMirrorStepPos;
+        ringPos.y += 5.0f;
+        EffectSsBlast_SpawnWhiteShockwave(play, &ringPos, &zero, &zero);
+        Vec3f burst = sMirrorStepPos;
+        burst.y += 30.0f;
+        SparkleBurst(play, burst, env, 12);
+        Sfx_PlaySfxCentered(NA_SE_IT_SWORD_STRIKE);
+        SpawnShockwave(play, sMirrorStepPos, 100, DMG_SLASH_MASTER, 2);
+    }
+}
+
 static void UpdateSwordBeam(PlayState* play) {
     Player* player = GET_PLAYER(play);
     if (player == NULL) {
         return;
     }
+    UpdateDarkLink(play, player);
 
     // A new swing starts when the weapon's attack state switches on.
     s8 meleeState = player->meleeWeaponState;
@@ -5377,7 +5476,7 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
 
 // Sets the run tunic's colour for Link's next draw.
 extern "C" void Roguelike_SetTunicEnvColor(PlayState* play) {
-    const Color_RGB8& c = sRunTunics[sRun.tunic].color;
+    Color_RGB8 c = IsDarkLink() ? Color_RGB8{ 22, 18, 30 } : sRunTunics[sRun.tunic].color;
     // Written straight into the opaque display list (what POLY_OPA_DISP points at) without OPEN_DISPS, which would
     // add frame interpolation bookkeeping that a single colour command doesn't need.
     GraphicsContext* gfxCtx = play->state.gfxCtx;
@@ -5496,7 +5595,7 @@ static void RegisterRoguelikeDescent() {
     COND_VB_SHOULD(VB_PLAYER_MODIFY_RUN_SPEED, true, {
         if (sRun.active &&
             (HasRelic(RELIC_PEGASUS_FEATHER) || Wearing(PLAYER_MASK_BUNNY) || HasRelic(RELIC_STONE_SKIN) ||
-             WearingTunic(RTUNIC_SWIFT) || HasBlade(RBLADE_HEAVY)) &&
+             WearingTunic(RTUNIC_SWIFT) || HasBlade(RBLADE_HEAVY) || IsDarkLink()) &&
             *should) {
             Player* player = va_arg(args, Player*);
             f32* speedTarget = va_arg(args, f32*);
@@ -5504,7 +5603,7 @@ static void RegisterRoguelikeDescent() {
             *speedTarget *=
                 1.0f + 0.2f * RelicCount(RELIC_PEGASUS_FEATHER) + (Wearing(PLAYER_MASK_BUNNY) ? 0.3f : 0.0f) -
                 0.1f * RelicCount(RELIC_STONE_SKIN) + (WearingTunic(RTUNIC_SWIFT) ? 0.15f : 0.0f) -
-                (HasBlade(RBLADE_HEAVY) ? 0.1f : 0.0f);
+                (HasBlade(RBLADE_HEAVY) ? 0.1f : 0.0f) + (IsDarkLink() ? 0.12f : 0.0f);
             func_8083DF68(player, *speedTarget, *yawTarget);
             func_8083DDC8(player, gPlayState);
             *should = false;
@@ -5514,7 +5613,7 @@ static void RegisterRoguelikeDescent() {
     // Run tunics recolour the Kokiri tunic. Drawn here rather than by changing the colour the game passes in, which
     // points at the game's shared colour table (and the player's cosmetics settings stay untouched).
     COND_VB_SHOULD(VB_APPLY_TUNIC_COLOR, true, {
-        if (sRun.active && sRun.tunic != RTUNIC_NONE && gPlayState != NULL &&
+        if (sRun.active && (sRun.tunic != RTUNIC_NONE || IsDarkLink()) && gPlayState != NULL &&
             CUR_EQUIP_VALUE(EQUIP_TYPE_TUNIC) == EQUIP_VALUE_TUNIC_KOKIRI) {
             Roguelike_SetTunicEnvColor(gPlayState);
             *should = false;

@@ -56,6 +56,7 @@ static const std::map<int32_t, const char*> roguelikeLoadouts = {
     { 2, "Goron Warrior (reach floor 8)" },
     { 3, "Sheikah (reach floor 12)" },
     { 4, "Zora Scout (reach floor 15)" },
+    { 5, "Dark Link (beat the Dark Link mini-boss)" },
 };
 
 static const std::map<int32_t, const char*> dekuStickCheat = {
@@ -1935,7 +1936,10 @@ void SohMenu::AddMenuEnhancements() {
                               " - Archer: also a bow with Twin Arrows, one heart fewer.\n"
                               " - Goron Warrior: Megaton Hammer, bombs, Goron Tunic, two more hearts, no shield.\n"
                               " - Sheikah: magic, Din's Fire and the Shadow Tunic, one heart fewer.\n"
-                              " - Zora Scout: Hookshot, Zora Tunic, Swift Tunic and a Fairy Friend."));
+                              " - Zora Scout: Hookshot, Zora Tunic, Swift Tunic and a Fairy Friend.\n"
+                              " - Dark Link: a shadow with the Master Sword and no shield. Every hit heals a little, "
+                              "he's faster, and a backflip or sidehop leaves a shadow that bursts - but he takes more "
+                              "damage and has two hearts fewer."));
     AddWidget(path, "Abandon Run", WIDGET_BUTTON)
         .Callback([](WidgetInfo& info) { Roguelike_RequestAbandonRun(); })
         .PreFunc([](WidgetInfo& info) { info.isHidden = !Roguelike_IsRunActive(); })
