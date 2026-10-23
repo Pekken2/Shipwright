@@ -16,6 +16,8 @@ bool Roguelike_IsRunActive();
 
 void Roguelike_RequestStartRun();
 void Roguelike_RequestAbandonRun();
+void Roguelike_RequestStartDailyRun();
+int Roguelike_GetDailyBest();
 int Roguelike_GetCurrentFloor();
 int Roguelike_GetBestFloor();
 int Roguelike_GetLevel();

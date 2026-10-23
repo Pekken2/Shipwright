@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,6 +77,11 @@ void func_8083DDC8(Player* player, PlayState* play);
 #define ROGUELIKE_TARGET_CHALLENGE CVarGetInteger(CVAR_ROGUELIKE("TargetChallenge"), 1)
 #define ROGUELIKE_SHOPS CVarGetInteger(CVAR_ROGUELIKE("Shops"), 1)
 #define ROGUELIKE_SHOP_EVERY CVarGetInteger(CVAR_ROGUELIKE("ShopEvery"), 4)
+#define ROGUELIKE_HUD CVarGetInteger(CVAR_ROGUELIKE("Hud"), 1)
+#define ROGUELIKE_REST_FLOORS CVarGetInteger(CVAR_ROGUELIKE("RestFloors"), 1)
+#define ROGUELIKE_CHAMPIONS CVarGetInteger(CVAR_ROGUELIKE("Champions"), 1)
+#define ROGUELIKE_LOADOUT CVarGetInteger(CVAR_ROGUELIKE("Loadout"), 0)
+#define ROGUELIKE_HISTORY_SIZE 10
 #define ROGUELIKE_BEST_FLOOR_CVAR CVAR_ROGUELIKE("BestFloor")
 
 // The game logic runs at 20 updates per second.
@@ -279,6 +285,12 @@ static struct {
     RoomRemix remix;        // this floor's prop/trap layout, if any
     bool arena;             // an open-world survival floor
     bool shop;              // a shop floor: no enemies, things to buy
+    bool rest;              // a rest floor (right after a boss): pick one blessing
+    int wavesTotal;         // waves this room started with (for the HUD)
+    int frames;             // gameplay frames this run (for the summary)
+    bool daily;             // a daily run: the same seed for everyone that day
+    int championAffix;      // a champion boss's element (an EnemyAffix), 0 if none
+    int loadout;            // the starting loadout this run uses
     s16 expectedScene;      // where this floor takes place; landing anywhere else means Link left (fled)
     bool fled;
     bool miniBoss; // a boss floor where no boss could be beaten with Link's gear: tough enemies instead
@@ -2194,16 +2206,26 @@ typedef enum {
     AFFIX_ICE,    // freezes Link
     AFFIX_POISON, // drains hearts over a few seconds
     AFFIX_SHOCK,  // electrocutes Link
+    AFFIX_SPLITTING, // splits in two when beaten
+    AFFIX_SHIELDED,  // only hurt from the sides or behind
+    AFFIX_MENDING,   // heals the enemies around it
     AFFIX_MAX,
 } EnemyAffix;
 
-static const char* sAffixNames[AFFIX_MAX] = { "", "Fire", "Ice", "Poison", "Shock" };
+static const char* sAffixNames[AFFIX_MAX] = { "", "Fire", "Ice", "Poison", "Shock", "Splitting", "Shielded", "Mending" };
 static const Color_RGBA8 sAffixPrim[AFFIX_MAX] = {
-    { 0, 0, 0, 0 }, { 255, 220, 120, 255 }, { 220, 255, 255, 255 }, { 210, 255, 140, 255 }, { 255, 255, 200, 255 },
+    { 0, 0, 0, 0 },          { 255, 220, 120, 255 }, { 220, 255, 255, 255 }, { 210, 255, 140, 255 },
+    { 255, 255, 200, 255 },  { 255, 200, 255, 255 }, { 255, 255, 255, 255 }, { 200, 255, 230, 255 },
 };
 static const Color_RGBA8 sAffixEnv[AFFIX_MAX] = {
-    { 0, 0, 0, 0 }, { 255, 60, 0, 255 }, { 60, 150, 255, 255 }, { 60, 200, 30, 255 }, { 255, 230, 0, 255 },
+    { 0, 0, 0, 0 },      { 255, 60, 0, 255 },    { 60, 150, 255, 255 },  { 60, 200, 30, 255 },
+    { 255, 230, 0, 255 }, { 200, 60, 255, 255 }, { 170, 180, 200, 255 }, { 40, 255, 170, 255 },
 };
+
+// The elements that do something to Link when an elite hits him (the others are about the elite itself).
+static bool IsElementalAffix(int affix) {
+    return affix == AFFIX_FIRE || affix == AFFIX_ICE || affix == AFFIX_POISON || affix == AFFIX_SHOCK;
+}
 
 typedef struct {
     int level;
@@ -2212,7 +2234,10 @@ typedef struct {
     int burnTicks; // Ember Edge: fire damage left to deal
     int burnTimer;
     int frozenFrames; // frames since it was last frozen (Shatter, Steam Burst)
+    int mendTimer;    // Mending elites: frames until the next heal
 } EnemyInfo;
+
+static std::unordered_set<Actor*> sSplitChildren; // halves of a Splitting elite: smaller, weaker, never elite
 
 static std::unordered_map<Actor*, EnemyInfo> sEnemies;
 static std::vector<EnemyAffix> sNewElites; // elites that appeared this frame, announced together
@@ -2293,6 +2318,8 @@ static void SetUpEnemy(Actor* actor) {
     info.burnTicks = 0;
     info.burnTimer = 0;
     info.frozenFrames = 0;
+    info.mendTimer = 0;
+    bool splitChild = sSplitChildren.count(actor) > 0;
 
     int eliteChance = std::min(8 + sRun.floor * 4, 60);
     if (sRun.modifier == FLOORMOD_ELITE) {
@@ -2301,6 +2328,9 @@ static void SetUpEnemy(Actor* actor) {
     bool isMiniBoss = sMiniBossActors.count(actor) > 0;
     if (sRun.bossFloor || sRun.miniBoss) {
         eliteChance = 0; // boss fights are hard enough
+    }
+    if (splitChild) {
+        eliteChance = 0;
     }
     if (ROGUELIKE_ELITES && RandInt(1, 100) <= eliteChance) {
         info.affix = (EnemyAffix)RandInt(AFFIX_FIRE, AFFIX_MAX - 1);
@@ -2315,6 +2345,10 @@ static void SetUpEnemy(Actor* actor) {
     if (isMiniBoss) {
         healthScale *= 1.25f;
         info.level += 3; // more XP
+    }
+    if (splitChild) {
+        healthScale *= 0.5f;
+        Actor_SetScale(actor, actor->scale.z * 0.75f);
     }
     // Giants: bigger and tougher. A few enemies only work at their normal size (same list as Enemy Sizes).
     bool canGrow = actor->id != ACTOR_EN_BROB && actor->id != ACTOR_EN_DHA && actor->id != ACTOR_EN_DH;
@@ -2348,7 +2382,15 @@ static void DrawAffixParticles(PlayState* play, Actor* actor, EnemyAffix affix) 
 static void OnActorUpdateRoguelike(void* refActor) {
     PlayState* play = gPlayState;
     Actor* actor = (Actor*)refActor;
-    if (!sRun.active || play == NULL || actor->category != ACTORCAT_ENEMY) {
+    if (!sRun.active || play == NULL) {
+        return;
+    }
+    // Champion bosses glow with their element.
+    if (actor->category == ACTORCAT_BOSS && sRun.championAffix != 0 && actor->update != NULL) {
+        DrawAffixParticles(play, actor, (EnemyAffix)sRun.championAffix);
+        return;
+    }
+    if (actor->category != ACTORCAT_ENEMY) {
         return;
     }
 
@@ -2372,6 +2414,26 @@ static void OnActorUpdateRoguelike(void* refActor) {
     // Link's level bonus: when this enemy loses health, take a bit more. Never finishes it off by itself, so the
     // enemy's own death handling always runs from a real hit.
     u8 health = actor->colChkInfo.health;
+
+    // Shielded elites shrug off hits from the front.
+    if (info.affix == AFFIX_SHIELDED && health < info.prevHealth && health > 0) {
+        Player* player = GET_PLAYER(play);
+        s16 toLink = (s16)(Actor_WorldYawTowardActor(actor, &player->actor) - actor->shape.rot.y);
+        if (ABS(toLink) < 0x3000) {
+            actor->colChkInfo.health = info.prevHealth;
+            health = info.prevHealth;
+            Vec3f sparkPos = actor->focus.pos;
+            Vec3f zero = { 0.0f, 0.0f, 0.0f };
+            Color_RGBA8 prim = { 255, 255, 255, 255 };
+            Color_RGBA8 env = { 170, 180, 200, 255 };
+            for (int i = 0; i < 4; i++) {
+                Vec3f vel = { RandFloat(-3.0f, 3.0f), RandFloat(0.0f, 3.0f), RandFloat(-3.0f, 3.0f) };
+                EffectSsKiraKira_SpawnDispersed(play, &sparkPos, &vel, &zero, &prim, &env, 1800, 6);
+            }
+            Sfx_PlaySfxCentered(NA_SE_IT_SHIELD_REFLECT_SW);
+        }
+    }
+
     if (health < info.prevHealth && health > 0) {
         int dealt = info.prevHealth - health;
         int bonusPct = PlayerDamageBonusPct(sRun.level) + (sRun.modifier == FLOORMOD_GLASS_CANNON ? 100 : 0) +
@@ -2495,6 +2557,29 @@ static void OnActorUpdateRoguelike(void* refActor) {
     }
     info.prevHealth = actor->colChkInfo.health;
 
+    // Mending elites patch up the enemies around them every few seconds.
+    if (info.affix == AFFIX_MENDING && ++info.mendTimer >= 3 * FRAMES_PER_SECOND) {
+        info.mendTimer = 0;
+        bool healed = false;
+        for (auto& [other, otherInfo] : sEnemies) {
+            if (other == actor || other->update == NULL || other->colChkInfo.health == 0 ||
+                Actor_WorldDistXYZToActor(other, actor) > 260.0f) {
+                continue;
+            }
+            u8 maxHealth = GetActorMaximumHealth(other);
+            if (maxHealth == 0 || other->colChkInfo.health >= maxHealth) {
+                continue;
+            }
+            other->colChkInfo.health = (u8)std::min<int>(maxHealth, other->colChkInfo.health + 2);
+            otherInfo.prevHealth = other->colChkInfo.health;
+            DrawAffixParticles(play, other, AFFIX_MENDING);
+            healed = true;
+        }
+        if (healed) {
+            Sfx_PlaySfxCentered(NA_SE_EV_FIATY_HEAL);
+        }
+    }
+
     if (info.affix != AFFIX_NONE) {
         DrawAffixParticles(play, actor, info.affix);
     }
@@ -2504,6 +2589,7 @@ static void AddFirePatch(const Vec3f& pos);
 
 static void OnActorDestroyRoguelike(void* refActor) {
     Actor* destroyed = (Actor*)refActor;
+    sSplitChildren.erase(destroyed);
     if (sRun.active && HasRelic(RELIC_FIREBOMBS) &&
         (destroyed->id == ACTOR_EN_BOM || destroyed->id == ACTOR_EN_BOM_CHU)) {
         AddFirePatch(destroyed->world.pos);
@@ -2535,10 +2621,31 @@ static void OnEnemyDefeatRoguelike(void* refActor) {
     }
     int level = it->second.level;
     bool elite = it->second.affix != AFFIX_NONE;
+    EnemyAffix deadAffix = it->second.affix;
     Vec3f deathPos = ((Actor*)refActor)->world.pos;
     sEnemies.erase(it);
     sRun.kills++;
     sFuryKills++;
+
+    // Splitting elites come apart into two smaller, weaker copies.
+    Actor* dead = (Actor*)refActor;
+    bool canSplit = dead->id != ACTOR_EN_DH && dead->id != ACTOR_EN_DHA && dead->id != ACTOR_EN_BROB &&
+                    dead->id != ACTOR_EN_FLOORMAS && dead->id != ACTOR_EN_IK && dead->id != ACTOR_EN_TORCH2 &&
+                    dead->id != ACTOR_EN_WALLMAS;
+    if (deadAffix == AFFIX_SPLITTING && canSplit) {
+        for (int i = 0; i < 2; i++) {
+            f32 side = i == 0 ? -35.0f : 35.0f;
+            Actor* half = Actor_Spawn(&play->actorCtx, play, dead->id, deathPos.x + side, deathPos.y, deathPos.z + side,
+                                      0, dead->shape.rot.y, 0, dead->params);
+            if (half != NULL) {
+                sSplitChildren.insert(half);
+                if (sRun.arena) {
+                    sArenaEnemies.push_back(half);
+                }
+            }
+        }
+        Sfx_PlaySfxCentered(NA_SE_EN_STAL_DAMAGE);
+    }
 
     // Rupees for the shops: most enemies drop one.
     if (ROGUELIKE_SHOPS && RandInt(1, 100) <= 60) {
@@ -2622,13 +2729,23 @@ static EnemyAffix FindAttackingAffix(PlayState* play) {
     EnemyAffix best = AFFIX_NONE;
     f32 bestDist = 200.0f;
     for (const auto& [actor, info] : sEnemies) {
-        if (info.affix == AFFIX_NONE || actor->update == NULL) {
+        if (!IsElementalAffix(info.affix) || actor->update == NULL) {
             continue;
         }
         f32 dist = Actor_WorldDistXYZToActor(actor, &player->actor);
         if (dist < bestDist) {
             bestDist = dist;
             best = info.affix;
+        }
+    }
+    // A champion boss's element.
+    if (sRun.championAffix != 0) {
+        for (Actor* boss = play->actorCtx.actorLists[ACTORCAT_BOSS].head; boss != NULL; boss = boss->next) {
+            f32 dist = Actor_WorldDistXYZToActor(boss, &player->actor);
+            if (boss->update != NULL && dist < 260.0f && dist < bestDist + 60.0f) {
+                bestDist = dist;
+                best = (EnemyAffix)sRun.championAffix;
+            }
         }
     }
     return best;
@@ -2707,6 +2824,9 @@ static void ScaleDamageTaken(PlayState* play, int16_t amount) {
     }
     if (HasRelic(RELIC_DINS_POWER)) {
         scaled *= 1.5f;
+    }
+    if (sRun.bossFloor && sRun.championAffix != 0) {
+        scaled *= 1.25f; // champion bosses hit harder
     }
     sHurtThisRoom = true;
     sFuryKills = 0;
@@ -2979,7 +3099,14 @@ static s32 PrepareBossFloor() {
     sRun.arena = false;
     sRun.expectedScene = boss.sceneNum;
 
+    sRun.rest = false;
     Notify("Floor " + std::to_string(sRun.floor) + ": BOSS - ", boss.name);
+    // From the second boss floor on, bosses come back as champions with an element.
+    if (ROGUELIKE_CHAMPIONS && sRun.floor > std::max(2, ROGUELIKE_BOSS_EVERY)) {
+        sRun.championAffix = RandInt(AFFIX_FIRE, AFFIX_SHOCK);
+        Notify("Champion! ", std::string(sAffixNames[sRun.championAffix]) + " " + boss.name +
+                                 " hits harder and its attacks carry its element. Beat it for a bonus relic.");
+    }
     return boss.entrance;
 }
 
@@ -3039,10 +3166,17 @@ static void TriggerTransition(PlayState* play, s32 entrance) {
 }
 
 static bool IsShopFloor(int floor);
+static std::string FormatTime(int seconds);
+
+// Right after every boss floor.
+static bool IsRestFloor(int floor) {
+    return ROGUELIKE_REST_FLOORS && floor > 1 && IsBossFloor(floor - 1);
+}
 
 // Picks the next floor's dungeon and sets everything up for the room drop. Returns the entrance to load.
 static s32 PrepareNextFloor() {
     sRun.floor++;
+    sRun.championAffix = 0;
     // Tunics are earned during the run (see WearTunicFor and the hot room check), never handed out per floor.
 
     sRun.miniBoss = false;
@@ -3054,8 +3188,9 @@ static s32 PrepareNextFloor() {
         sRun.miniBossSet = RandInt(0, (int)ARRAY_COUNT(sMiniBossSets) - 1);
     }
     sRun.bossFloor = false;
-    sRun.shop = !sRun.miniBoss && IsShopFloor(sRun.floor);
-    bool calm = sRun.miniBoss || sRun.shop;
+    sRun.rest = !sRun.miniBoss && IsRestFloor(sRun.floor);
+    sRun.shop = !sRun.miniBoss && !sRun.rest && IsShopFloor(sRun.floor);
+    bool calm = sRun.miniBoss || sRun.shop || sRun.rest;
     sRun.modifier = calm ? FLOORMOD_NONE : RollFloorModifier(sRun.floor);
     sRun.remix = calm ? REMIX_NONE : RollRoomRemix();
 
@@ -3090,6 +3225,9 @@ static s32 PrepareNextFloor() {
     Notify("Floor " + std::to_string(sRun.floor) + ": ", d.name);
     if (sRun.shop) {
         Notify("Shop floor! ", "Time to spend those rupees.");
+    }
+    if (sRun.rest) {
+        Notify("Rest floor. ", "A moment of calm after the boss.");
     }
     if (sRun.miniBoss) {
         Notify("MINI-BOSS: ", sMiniBossSets[sRun.miniBossSet].name);
@@ -3188,6 +3326,12 @@ static void ResetRunState() {
     sRun.tunic = RTUNIC_NONE;
     sRun.blade = RBLADE_NONE;
     sRun.shop = false;
+    sRun.rest = false;
+    sRun.wavesTotal = 0;
+    sRun.frames = 0;
+    sRun.daily = false;
+    sRun.championAffix = 0;
+    sRun.loadout = 0;
     sVengeanceReady = false;
     sParryCrit = false;
     sThunderHits = 0;
@@ -3199,6 +3343,157 @@ static void ResetRunState() {
     sPrevArrows = -1;
     sChoiceCount = 0;
     ResetLeveling();
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Starting loadouts: unlocked by reaching floors. Daily runs always use the Hero.
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef struct {
+    const char* name;
+    int unlockFloor;
+} LoadoutInfo;
+
+static const LoadoutInfo sLoadouts[] = {
+    { "Hero", 0 }, { "Archer", 5 }, { "Goron Warrior", 8 }, { "Sheikah", 12 }, { "Zora Scout", 15 },
+};
+
+static bool sDailyRequested = false;
+
+// Puts an item on a free C button. Without a running game (a run started from File Select) the icons load with the
+// scene, so only the button data is set.
+static void PutOnCButton(PlayState* play, u8 item) {
+    if (play != NULL) {
+        AssignToFreeCButton(play, item);
+        return;
+    }
+    for (s32 button = 1; button <= 3; button++) {
+        if (gSaveContext.equips.buttonItems[button] == ITEM_NONE) {
+            gSaveContext.equips.buttonItems[button] = item;
+            gSaveContext.equips.cButtonSlots[button - 1] = SLOT(item);
+            return;
+        }
+    }
+}
+
+static void ChangeStartingHearts(int hearts) {
+    s16 capacity = (s16)std::clamp(gSaveContext.healthCapacity + hearts * 16, 16, 20 * 16);
+    gSaveContext.healthCapacity = capacity;
+    gSaveContext.health = capacity;
+}
+
+static void ApplyLoadoutExtras(PlayState* play) {
+    int choice = sRun.daily ? 0 : std::clamp(ROGUELIKE_LOADOUT, 0, (int)ARRAY_COUNT(sLoadouts) - 1);
+    if (sLoadouts[choice].unlockFloor > CVarGetInteger(ROGUELIKE_BEST_FLOOR_CVAR, 0)) {
+        choice = 0; // not unlocked yet
+    }
+    sRun.loadout = choice;
+
+    switch (choice) {
+        case 1: // Archer: a bow and Twin Arrows, one heart fewer
+            INV_CONTENT(ITEM_BOW) = ITEM_BOW;
+            Inventory_ChangeUpgrade(UPG_QUIVER, 1);
+            AMMO(ITEM_BOW) = 30;
+            PutOnCButton(play, ITEM_BOW);
+            GrantRelic(play, RELIC_TWIN_ARROWS);
+            ChangeStartingHearts(-1);
+            break;
+        case 2: // Goron Warrior: Megaton Hammer, bombs, the Goron Tunic and two more hearts, but no shield
+            INV_CONTENT(ITEM_HAMMER) = ITEM_HAMMER;
+            INV_CONTENT(ITEM_BOMB) = ITEM_BOMB;
+            Inventory_ChangeUpgrade(UPG_BOMB_BAG, 1);
+            AMMO(ITEM_BOMB) = 20;
+            PutOnCButton(play, ITEM_HAMMER);
+            PutOnCButton(play, ITEM_BOMB);
+            GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_GORON);
+            gSaveContext.inventory.equipment &= ~OWNED_EQUIP_FLAG(EQUIP_TYPE_SHIELD, EQUIP_INV_SHIELD_DEKU);
+            SetEquipValue(EQUIP_TYPE_SHIELD, EQUIP_VALUE_SHIELD_NONE);
+            gSaveContext.adultEquips = gSaveContext.equips;
+            ChangeStartingHearts(2);
+            break;
+        case 3: // Sheikah: magic, Din's Fire and the Shadow Tunic, one heart fewer
+            GiveMagic(play, false);
+            INV_CONTENT(ITEM_DINS_FIRE) = ITEM_DINS_FIRE;
+            PutOnCButton(play, ITEM_DINS_FIRE);
+            PutOnTunic(play, RTUNIC_SHADOW);
+            ChangeStartingHearts(-1);
+            break;
+        case 4: // Zora Scout: Hookshot, the Zora Tunic, Swift Tunic and a Fairy Friend
+            INV_CONTENT(ITEM_HOOKSHOT) = ITEM_HOOKSHOT;
+            PutOnCButton(play, ITEM_HOOKSHOT);
+            GiveOwnedEquip(EQUIP_TYPE_TUNIC, EQUIP_INV_TUNIC_ZORA);
+            PutOnTunic(play, RTUNIC_SWIFT);
+            GrantRelic(play, RELIC_FAIRY_FRIEND);
+            break;
+        default:
+            break;
+    }
+    if (choice != 0) {
+        Notify("Loadout: ", sLoadouts[choice].name);
+    }
+}
+
+static int TodaysDate() {
+    std::time_t now = std::time(nullptr);
+    std::tm local = *std::localtime(&now);
+    return (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+}
+
+static std::string DateText(int date) {
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d", date / 10000, (date / 100) % 100, date % 100);
+    return buffer;
+}
+
+// Every run's RNG gets a fresh seed, except a daily run: the same seed (the date) for everyone that day.
+static void SeedRun() {
+    if (sDailyRequested) {
+        sDailyRequested = false;
+        sRun.daily = true;
+        sRng.seed((u32)TodaysDate());
+        Notify("Daily run ", DateText(TodaysDate()) + ": the same floors and rewards for everyone today.");
+    } else {
+        sRun.daily = false;
+        sRng.seed(std::random_device{}());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Run summary and history: shown when a run ends, and the last runs are kept for the menu.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static std::string HistoryCVar(int index) {
+    return std::string(CVAR_ROGUELIKE("History")) + std::to_string(index);
+}
+
+static void RecordRunResult(const char* outcome) {
+    int relics = 0;
+    for (int r = 0; r < RELIC_COUNT; r++) {
+        relics += sRelics[r];
+    }
+    std::string time = FormatTime(sRun.frames / FRAMES_PER_SECOND);
+    std::string stats = "Floor " + std::to_string(sRun.floor) + ", level " + std::to_string(sRun.level) + ", " +
+                        std::to_string(sRun.kills) + " kills, " + time + ", " + std::to_string(relics) + " relics";
+    Notify("Run summary: ", stats + ".");
+
+    std::string entry = std::string(sRun.daily ? "[Daily " + DateText(TodaysDate()) + "] " : "") +
+                        sLoadouts[sRun.loadout].name + " - " + stats + " - " + outcome;
+    for (int i = ROGUELIKE_HISTORY_SIZE - 1; i > 0; i--) {
+        std::string older = CVarGetString(HistoryCVar(i - 1).c_str(), "");
+        CVarSetString(HistoryCVar(i).c_str(), older.c_str());
+    }
+    CVarSetString(HistoryCVar(0).c_str(), entry.c_str());
+
+    if (sRun.daily) {
+        int today = TodaysDate();
+        if (CVarGetInteger(CVAR_ROGUELIKE("DailyDate"), 0) != today) {
+            CVarSetInteger(CVAR_ROGUELIKE("DailyDate"), today);
+            CVarSetInteger(CVAR_ROGUELIKE("DailyBest"), sRun.floor);
+        } else if (sRun.floor > CVarGetInteger(CVAR_ROGUELIKE("DailyBest"), 0)) {
+            CVarSetInteger(CVAR_ROGUELIKE("DailyBest"), sRun.floor);
+        }
+    }
+    Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
 }
 
 static void StartRun(PlayState* play) {
@@ -3214,7 +3509,9 @@ static void StartRun(PlayState* play) {
     }
 
     ResetRunState();
+    SeedRun();
     ApplyStartingLoadout();
+    ApplyLoadoutExtras(play);
     Notify("Roguelike run started. ", "Clear each room to descend!");
     GoToNextFloor(play);
 }
@@ -3223,10 +3520,12 @@ static void StartRun(PlayState* play) {
 // no intro cutscene, and the first load goes directly into the first room.
 static void StartRunFromFileLoad() {
     ResetRunState();
+    SeedRun();
     ApplyStartingLoadout();
     // The file select screen has already set up the magic meter for the file's saved state; clear that out too.
     gSaveContext.magicFillTarget = 0;
     gSaveContext.magicCapacity = 0;
+    ApplyLoadoutExtras(NULL);
 
     gSaveContext.entranceIndex = PrepareNextFloor();
     gSaveContext.cutsceneIndex = 0;
@@ -3291,6 +3590,7 @@ static void OnRunOver(PlayState* play) {
         result += " (best: " + std::to_string(previousBest) + ")";
     }
     Notify("Run over. ", result);
+    RecordRunResult("Defeated");
 
     // Roguelike Descent files have no "real" save to go back to, so they always roll straight into a new run.
     if (IS_ROGUELIKE || ROGUELIKE_AUTO_RESTART) {
@@ -3298,6 +3598,21 @@ static void OnRunOver(PlayState* play) {
     } else {
         EndRun(play);
     }
+}
+
+// The room timer for the current room, in seconds (0 = no timer).
+static int RoomTimeLimitSeconds() {
+    int limit = sRun.miniBoss ? 0 : ROGUELIKE_ROOM_TIME_LIMIT; // no timer on a mini-boss
+    if (sRun.arena && limit > 0) {
+        limit = std::max(limit, 180); // arenas have more to fight
+    }
+    if (sRun.modifier == FLOORMOD_HASTY) {
+        limit = 45;
+    }
+    if (limit > 0) {
+        limit += 30 * RelicCount(RELIC_SANDS_OF_TIME);
+    }
+    return limit;
 }
 
 static void EnterRoomState(RoomState state) {
@@ -3478,6 +3793,13 @@ static void OnBossCleared(PlayState* play) {
         Notify("Reward: ", "Heart Container", GetTextureForItemId(ITEM_HEART_CONTAINER));
     }
     gSaveContext.healthAccumulator = gSaveContext.healthCapacity; // full heal
+    if (sRun.championAffix != 0) {
+        Relic bonusRelic = PickRelic(false, {});
+        if (bonusRelic != RELIC_NONE) {
+            Notify("Champion slain! ", "A bonus relic.");
+            GrantRelic(play, bonusRelic);
+        }
+    }
 
     // A bonus that chests can't hold.
     std::vector<RoguelikeReward> bonus;
@@ -4173,6 +4495,7 @@ typedef enum {
     SHOP_TREASURE, // a random major item
     SHOP_HEAL,     // full heal
     SHOP_HEART,    // +1 heart container
+    SHOP_UPGRADE,  // rest floors: one more stack of a relic Link has
     SHOP_EXIT,
 } ShopKind;
 
@@ -4188,6 +4511,7 @@ static std::vector<ShopSlot> sShopSlots;
 static int sShopStandSlot = -1;   // the spot Link is on
 static int sShopStandFrames = 0;
 static bool sShopArmed = false;   // spots only work once Link has stepped off them (he may land on one)
+static bool sShopIsRest = false;  // a rest floor: everything is free, but only one can be taken
 static constexpr int SHOP_BUY_FRAMES = 25;
 static constexpr int SHOP_EXIT_FRAMES = 30;
 
@@ -4220,6 +4544,18 @@ static void GiveShopTreasure(PlayState* play) {
 }
 
 static std::string ShopSlotName(const ShopSlot& slot) {
+    if (sShopIsRest) {
+        switch (slot.kind) {
+            case SHOP_HEAL:
+                return "Fairy's Embrace - a full heal.";
+            case SHOP_HEART:
+                return "Fairy's Gift - one more heart container.";
+            case SHOP_UPGRADE:
+                return "Fairy's Blessing - one more stack of a relic you have (or a new relic).";
+            default:
+                break;
+        }
+    }
     switch (slot.kind) {
         case SHOP_RELIC:
             return std::string("Relic: ") + sRelicInfo[slot.relic].name + " - " + sRelicInfo[slot.relic].description;
@@ -4234,11 +4570,87 @@ static std::string ShopSlotName(const ShopSlot& slot) {
     }
 }
 
+// Calm floors (shops, rests) are safe: the room's own monsters are chased off.
+static void ClearRoomForCalmFloor(PlayState* play) {
+    for (Actor* actor = play->actorCtx.actorLists[ACTORCAT_ENEMY].head; actor != NULL; actor = actor->next) {
+        Vec3f pos = actor->world.pos;
+        pos.y += 20.0f;
+        Vec3f zero = { 0.0f, 0.0f, 0.0f };
+        EffectSsDeadDb_Spawn(play, &pos, &zero, &zero, 100, 0, 255, 255, 255, 255, 0, 0, 255, 1, 9, true);
+        Actor_Kill(actor);
+    }
+}
+
+static void PlaceExitSpot(PlayState* play) {
+    // The way on. If there's truly nowhere to put it, it goes where Link stands (he has to step off first).
+    ShopSlot exit = { {}, SHOP_EXIT, RELIC_NONE, 0, false };
+    if (!FindRemixSpot(play, 140.0f, 360.0f, 95.0f, &exit.pos)) {
+        exit.pos = GET_PLAYER(play)->actor.world.pos;
+    }
+    sShopSlots.push_back(exit);
+}
+
+static bool AnyRelicUpgradable() {
+    for (int r = 0; r < RELIC_COUNT; r++) {
+        if (sRelics[r] > 0 && sRelics[r] < sRelicInfo[r].maxStacks && RelicUsable((Relic)r)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void UpgradeRandomRelic(PlayState* play) {
+    std::vector<Relic> owned;
+    for (int r = 0; r < RELIC_COUNT; r++) {
+        if (sRelics[r] > 0 && sRelics[r] < sRelicInfo[r].maxStacks && RelicUsable((Relic)r)) {
+            owned.push_back((Relic)r);
+        }
+    }
+    Relic relic = owned.empty() ? PickRelic(false, {}) : owned[RandInt(0, (int)owned.size() - 1)];
+    if (relic == RELIC_NONE) {
+        gSaveContext.health = gSaveContext.healthCapacity;
+        Notify("Fully healed.");
+        return;
+    }
+    Audio_PlayFanfare(NA_BGM_ITEM_GET | 0x900);
+    GrantRelic(play, relic);
+}
+
+// Rest floors: a calm room after a boss with three free blessings. Taking one makes the others fade.
+static void SetupRest(PlayState* play) {
+    sShopSlots.clear();
+    sShopStandSlot = -1;
+    sShopStandFrames = 0;
+    sShopArmed = false;
+    sShopIsRest = true;
+    sRemixSpots.clear();
+    ClearRoomForCalmFloor(play);
+
+    std::vector<ShopSlot> blessings = { { {}, SHOP_HEAL, RELIC_NONE, 0, false } };
+    if (gSaveContext.healthCapacity < 20 * 16) {
+        blessings.push_back({ {}, SHOP_HEART, RELIC_NONE, 0, false });
+    }
+    if (ROGUELIKE_RELICS && (AnyRelicUpgradable() || PickRelic(false, {}) != RELIC_NONE)) {
+        blessings.push_back({ {}, SHOP_UPGRADE, RELIC_NONE, 0, false });
+    }
+    for (ShopSlot slot : blessings) {
+        if (FindRemixSpot(play, 110.0f, 300.0f, 95.0f, &slot.pos)) {
+            sShopSlots.push_back(slot);
+        }
+    }
+    PlaceExitSpot(play);
+
+    Sfx_PlaySfxCentered(NA_SE_EV_FIATY_HEAL);
+    Notify("A Great Fairy's rest. ", "Choose one blessing: stand on a light to see it, stay there to take it. "
+                                     "The blue light leads on.");
+}
+
 static void SetupShop(PlayState* play) {
     sShopSlots.clear();
     sShopStandSlot = -1;
     sShopStandFrames = 0;
     sShopArmed = false;
+    sShopIsRest = false;
     sRemixSpots.clear();
 
     // Shops are safe: the room's own monsters are chased off.
@@ -4273,12 +4685,7 @@ static void SetupShop(PlayState* play) {
             sShopSlots.push_back(slot);
         }
     }
-    // The way on. If there's truly nowhere to put it, it goes where Link stands (he has to step off first).
-    ShopSlot exit = { {}, SHOP_EXIT, RELIC_NONE, 0, false };
-    if (!FindRemixSpot(play, 140.0f, 360.0f, 95.0f, &exit.pos)) {
-        exit.pos = GET_PLAYER(play)->actor.world.pos;
-    }
-    sShopSlots.push_back(exit);
+    PlaceExitSpot(play);
 
     Sfx_PlaySfxCentered(NA_SE_SY_TRE_BOX_APPEAR);
     Notify("Shop! ", "Stand on a glowing spot to see what it is and its price, and stay there to buy it. "
@@ -4313,8 +4720,19 @@ static void BuyShopSlot(PlayState* play, ShopSlot& slot) {
             Audio_PlayFanfare(NA_BGM_ITEM_GET | 0x900);
             Notify("Heart Container! ", "One more heart.");
             break;
+        case SHOP_UPGRADE:
+            UpgradeRandomRelic(play);
+            break;
         default:
             break;
+    }
+    // On a rest floor only one blessing can be taken.
+    if (sShopIsRest) {
+        for (ShopSlot& other : sShopSlots) {
+            if (other.kind != SHOP_EXIT) {
+                other.sold = true;
+            }
+        }
     }
 }
 
@@ -4338,6 +4756,9 @@ static void UpdateShop(PlayState* play) {
                     break;
                 case SHOP_EXIT:
                     env = { 60, 140, 255, 255 };
+                    break;
+                case SHOP_UPGRADE:
+                    env = { 255, 140, 220, 255 };
                     break;
                 default:
                     env = { 80, 255, 120, 255 };
@@ -4376,6 +4797,8 @@ static void UpdateShop(PlayState* play) {
         Sfx_PlaySfxCentered(NA_SE_SY_CURSOR);
         if (slot.kind == SHOP_EXIT) {
             Notify(ShopSlotName(slot));
+        } else if (slot.price == 0) {
+            Notify(ShopSlotName(slot) + " ", "Stay here to choose it.");
         } else {
             Notify(std::to_string(slot.price) + " rupees. ", ShopSlotName(slot) + " Stay here to buy.");
         }
@@ -4415,6 +4838,7 @@ static void OnPlayerUpdateRoguelike() {
         if (play->transitionTrigger == TRANS_TRIGGER_OFF) {
             SaveBestFloor(sRun.floor);
             Notify("Run abandoned on floor ", std::to_string(sRun.floor));
+            RecordRunResult("Abandoned");
             if (IS_ROGUELIKE) {
                 StartRun(play); // nothing to return to on a Roguelike Descent file: start over
             } else {
@@ -4454,14 +4878,19 @@ static void OnPlayerUpdateRoguelike() {
 
     sRun.roomFrames++;
     sRun.stateFrames++;
+    sRun.frames++;
     UpdateLeveling(play);
     UpdateSwordBeam(play);
     UpdateFairyCompanion(play);
 
     switch (sRun.roomState) {
         case ROOM_STATE_ENTERING:
-            if (sRun.shop && sRun.stateFrames >= WAVE_SPAWN_DELAY) {
-                SetupShop(play);
+            if ((sRun.shop || sRun.rest) && sRun.stateFrames >= WAVE_SPAWN_DELAY) {
+                if (sRun.rest) {
+                    SetupRest(play);
+                } else {
+                    SetupShop(play);
+                }
                 EnterRoomState(ROOM_STATE_SHOP);
                 break;
             }
@@ -4506,16 +4935,7 @@ static void OnPlayerUpdateRoguelike() {
                 }
                 break;
             }
-            int limit = sRun.miniBoss ? 0 : ROGUELIKE_ROOM_TIME_LIMIT; // no timer on a mini-boss
-            if (sRun.arena && limit > 0) {
-                limit = std::max(limit, 180); // arenas have more to fight
-            }
-            if (sRun.modifier == FLOORMOD_HASTY) {
-                limit = 45;
-            }
-            if (limit > 0) {
-                limit += 30 * RelicCount(RELIC_SANDS_OF_TIME);
-            }
+            int limit = RoomTimeLimitSeconds();
             if (limit > 0 && sRun.roomFrames >= limit * FRAMES_PER_SECOND) {
                 OnRoomCleared(play, true);
             }
@@ -4608,6 +5028,7 @@ static void OnSceneInitRoguelike(int16_t sceneNum) {
     if (sRun.miniBoss) {
         sRun.wavesLeft = 1; // just the mini-boss itself
     }
+    sRun.wavesTotal = sRun.wavesLeft;
     if (sRun.expectedScene >= 0 && sceneNum != sRun.expectedScene) {
         sRun.fled = true;
     }
@@ -4760,9 +5181,83 @@ static void OnGameFrameUpdateRoguelike() {
 }
 
 // Shows Link's level/XP and the floor along the bottom of the pause screen while a run is active.
+static std::string FormatTime(int seconds) {
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "%d:%02d", seconds / 60, seconds % 60);
+    return buffer;
+}
+
+static void SetupHudText(PlayState* play) {
+    OPEN_DISPS(play->state.gfxCtx);
+    Gfx_SetupDL_39Opa(play->state.gfxCtx);
+    gDPSetAlphaDither(POLY_OPA_DISP++, G_AD_DISABLE);
+    gSPClearGeometryMode(POLY_OPA_DISP++, G_SHADE);
+    gDPSetCombineLERP(POLY_OPA_DISP++, 0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, PRIMITIVE, TEXEL0, 0,
+                      PRIMITIVE, 0);
+    CLOSE_DISPS(play->state.gfxCtx);
+}
+
+// During play: one line along the bottom with the floor, the wave and the room timer.
+static void DrawRunHud(PlayState* play) {
+    if (!ROGUELIKE_HUD || play->msgCtx.msgMode != MSGMODE_NONE) {
+        return;
+    }
+    u8 alpha = (u8)std::min<u16>(play->interfaceCtx.healthAlpha, 255);
+    if (alpha == 0) {
+        return;
+    }
+
+    std::string text = std::string(sRun.daily ? "Daily  " : "") + "Floor " + std::to_string(sRun.floor);
+    bool urgent = false;
+    switch (sRun.roomState) {
+        case ROOM_STATE_ENTERING:
+            text += sRun.shop ? "  Shop" : (sRun.rest ? "  Rest" : "  Get ready");
+            break;
+        case ROOM_STATE_FIGHTING: {
+            int wave = std::clamp(sRun.wavesTotal - sRun.wavesLeft, 1, std::max(1, sRun.wavesTotal));
+            text += sRun.miniBoss ? "  Mini-boss" : "  Wave " + std::to_string(wave) + "/" + std::to_string(sRun.wavesTotal);
+            int limit = RoomTimeLimitSeconds();
+            if (limit > 0) {
+                int left = std::max(0, limit - sRun.roomFrames / FRAMES_PER_SECOND);
+                text += "  " + FormatTime(left);
+                urgent = left <= 10;
+            }
+            break;
+        }
+        case ROOM_STATE_BOSS:
+            text += sRun.championAffix != 0 ? std::string("  Champion boss (") + sAffixNames[sRun.championAffix] + ")"
+                                            : "  Boss";
+            break;
+        case ROOM_STATE_CLEARED:
+            text += "  Cleared!";
+            break;
+        case ROOM_STATE_SHOP:
+            text += sRun.rest ? "  Rest" : "  Shop";
+            break;
+        case ROOM_STATE_RUN_OVER:
+            text += "  Run over";
+            break;
+    }
+
+    SetupHudText(play);
+    int x = 160 - (int)(text.size() * 6 * 0.7f) / 2;
+    if (urgent) {
+        Interface_DrawTextLine(play->state.gfxCtx, (char*)text.c_str(), (s16)x, 220, 255, 90, 90, alpha, 0.7f, 1);
+    } else {
+        Interface_DrawTextLine(play->state.gfxCtx, (char*)text.c_str(), (s16)x, 220, 255, 255, 255, alpha, 0.7f, 1);
+    }
+}
+
 extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
+    if (!sRun.active || play == NULL) {
+        return;
+    }
+    if (play->pauseCtx.state == 0) {
+        DrawRunHud(play);
+        return;
+    }
     // Only on the main pause screen (not while it opens/closes or on the save prompt).
-    if (!sRun.active || play == NULL || play->pauseCtx.state != 6 || play->pauseCtx.debugState != 0) {
+    if (play->pauseCtx.state != 6 || play->pauseCtx.debugState != 0) {
         return;
     }
 
@@ -4799,6 +5294,15 @@ extern "C" void Roguelike_DrawPauseInfo(PlayState* play) {
     }
     if (sRun.shop) {
         addTwist("Shop");
+    }
+    if (sRun.rest) {
+        addTwist("Rest");
+    }
+    if (sRun.championAffix != 0) {
+        addTwist(std::string("Champion (") + sAffixNames[sRun.championAffix] + ")");
+    }
+    if (sRun.daily) {
+        addTwist("Daily run");
     }
     if (sRun.modifier != FLOORMOD_NONE) {
         addTwist(sModifierNames[sRun.modifier]);
@@ -4903,6 +5407,18 @@ void Roguelike_RequestStartRun() {
     if (GameInteractor::IsSaveLoaded(false) && !sRun.active) {
         sStartRequested = true;
     }
+}
+
+void Roguelike_RequestStartDailyRun() {
+    if (GameInteractor::IsSaveLoaded(false) && !sRun.active) {
+        sDailyRequested = true;
+        sStartRequested = true;
+    }
+}
+
+int Roguelike_GetDailyBest() {
+    return CVarGetInteger(CVAR_ROGUELIKE("DailyDate"), 0) == TodaysDate() ? CVarGetInteger(CVAR_ROGUELIKE("DailyBest"), 0)
+                                                                          : 0;
 }
 
 void Roguelike_RequestAbandonRun() {

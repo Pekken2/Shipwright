@@ -50,6 +50,14 @@ static std::map<int32_t, const char*> bunnyHoodEffectMap = {
     { BUNNY_HOOD_FAST_AND_JUMP, "Faster + Longer Jump" },
 };
 
+static const std::map<int32_t, const char*> roguelikeLoadouts = {
+    { 0, "Hero" },
+    { 1, "Archer (reach floor 5)" },
+    { 2, "Goron Warrior (reach floor 8)" },
+    { 3, "Sheikah (reach floor 12)" },
+    { 4, "Zora Scout (reach floor 15)" },
+};
+
 static const std::map<int32_t, const char*> dekuStickCheat = {
     { DEKU_STICK_NORMAL, "Normal" },
     { DEKU_STICK_UNBREAKABLE, "Unbreakable" },
@@ -1902,6 +1910,32 @@ void SohMenu::AddMenuEnhancements() {
             "dying ends the run.\n\n"
             "Your save is snapshotted when the run starts and restored when it ends, and saving is blocked during "
             "the run, so your real progress is never touched."));
+    AddWidget(path, "Start Daily Run", WIDGET_BUTTON)
+        .Callback([](WidgetInfo& info) { Roguelike_RequestStartDailyRun(); })
+        .PreFunc([](WidgetInfo& info) {
+            info.isHidden = Roguelike_IsRunActive();
+            info.options->disabled = !GameInteractor::IsSaveLoaded(false);
+            info.options->disabledTooltip = "Load a save file first.";
+        })
+        .Options(ButtonOptions().Tooltip(
+            "A run with today's seed: everyone gets the same floors, enemies and rewards today. Always uses the "
+            "Hero loadout. Your best floor for today is shown below."));
+    AddWidget(path, "Daily Best", WIDGET_TEXT).PreFunc([](WidgetInfo& info) {
+        int best = Roguelike_GetDailyBest();
+        info.name = best > 0 ? "Today's daily best: floor " + std::to_string(best) : "No daily run yet today.";
+    });
+    AddWidget(path, "Starting Loadout", WIDGET_CVAR_COMBOBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Loadout"))
+        .Options(ComboboxOptions()
+                     .ComboMap(roguelikeLoadouts)
+                     .DefaultIndex(0)
+                     .Tooltip("What Link starts a run with. More unlock as your best floor goes up (a locked choice "
+                              "starts as the Hero):\n\n"
+                              " - Hero: Kokiri Sword and Deku Shield.\n"
+                              " - Archer: also a bow with Twin Arrows, one heart fewer.\n"
+                              " - Goron Warrior: Megaton Hammer, bombs, Goron Tunic, two more hearts, no shield.\n"
+                              " - Sheikah: magic, Din's Fire and the Shadow Tunic, one heart fewer.\n"
+                              " - Zora Scout: Hookshot, Zora Tunic, Swift Tunic and a Fairy Friend."));
     AddWidget(path, "Abandon Run", WIDGET_BUTTON)
         .Callback([](WidgetInfo& info) { Roguelike_RequestAbandonRun(); })
         .PreFunc([](WidgetInfo& info) { info.isHidden = !Roguelike_IsRunActive(); })
@@ -2012,10 +2046,35 @@ void SohMenu::AddMenuEnhancements() {
             "Feather, Lucky Clover, Scholar's Lens, Navi's Eye, Glass Sword, Cursed Mask). Sometimes an ornate "
             "devil deal chest appears: a strong relic that costs a heart container. Collected relics are listed "
             "at the top of the pause screen."));
+    AddWidget(path, "Run HUD", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Hud"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "Shows the floor, the current wave and the room timer along the bottom of the screen during a run."));
+    AddWidget(path, "Rest Floors", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.RestFloors"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "The floor after every boss floor is a Great Fairy's rest with no enemies: pick one blessing - a full "
+            "heal, a heart container, or one more stack of a relic you have."));
+    AddWidget(path, "Champion Bosses", WIDGET_CVAR_CHECKBOX)
+        .CVar(CVAR_ENHANCEMENT("Roguelike.Champions"))
+        .Options(CheckboxOptions().DefaultValue(true).Tooltip(
+            "From the second boss floor on, bosses come back as champions with an element (fire, ice, poison or "
+            "shock): they hit harder and their attacks carry the element. Beating one gives a bonus relic."));
     AddWidget(path, "Restart Run Automatically on Death", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("Roguelike.AutoRestart"))
         .Options(
             CheckboxOptions().Tooltip("Immediately start a fresh run when you die instead of returning to your save."));
+    AddWidget(path, "Recent Runs", WIDGET_SEPARATOR_TEXT).PreFunc([](WidgetInfo& info) {
+        info.isHidden = std::string(CVarGetString(CVAR_ENHANCEMENT("Roguelike.History0"), "")).empty();
+    });
+    for (int i = 0; i < 10; i++) {
+        AddWidget(path, "Run History " + std::to_string(i), WIDGET_TEXT).PreFunc([i](WidgetInfo& info) {
+            std::string cvar = std::string(CVAR_ENHANCEMENT("Roguelike.History")) + std::to_string(i);
+            std::string entry = CVarGetString(cvar.c_str(), "");
+            info.isHidden = entry.empty();
+            info.name = std::to_string(i + 1) + ". " + entry;
+        });
+    }
     AddWidget(path, "Shadow Tag Mode", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_ENHANCEMENT("ShadowTag"))
         .Options(CheckboxOptions().Tooltip("A Wallmaster follows Link everywhere, don't get caught!"));
